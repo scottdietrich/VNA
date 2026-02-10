@@ -227,7 +227,13 @@ class VNAController:
         return True
 
     def setup_cw_mode(self, frequency, ifbw, power):
-        """Configure VNA for CW (single frequency) measurement."""
+        """Configure VNA for CW (single frequency) measurement.
+
+        RF output stays ON continuously so the sample is always excited.
+        The VNA runs in continuous trigger mode; data is read on demand.
+        This avoids transient effects from pulsing the RF, which is
+        critical for EPR/FMR where thermal and spin equilibrium matter.
+        """
         if not self.connected:
             return False
 
@@ -236,9 +242,7 @@ class VNAController:
 
         # Abort any ongoing operation
         self.write(":ABOR")
-
-        # Single sweep mode (not continuous)
-        self.write(":INIT:CONT OFF")
+        time.sleep(0.05)
 
         # For CW mode: set start = stop = CW frequency, 1 point
         self.write(f":SENS:FREQ:STAR {frequency}")
@@ -262,37 +266,47 @@ class VNAController:
         # Set S-parameter
         self.write(f":CALC1:PAR1:DEF {self.s_parameter}")
 
+        # Set data format to real/imag pairs
+        self.write(":CALC1:FORM SDAT")
+
+        # Turn RF ON and keep it on continuously
+        self.write(":OUTP ON")
+
+        # Continuous trigger mode: VNA sweeps repeatedly, RF always on
+        # Data buffer always has fresh data; we just read when ready
+        self.write(":INIT:CONT ON")
+
         # Query actual settings for diagnostic
         try:
             actual_ifbw = self.query(":SENS:BAND?")
             actual_smo = self.query(":CALC1:SMO?")
             actual_avg = self.query(":SENS:AVER?")
-            print(f"VNA CW setup: IFBW={actual_ifbw.strip()}, Smooth={actual_smo.strip()}, Avg={actual_avg.strip()}")
+            print(f"VNA CW setup: IFBW={actual_ifbw.strip()}, Smooth={actual_smo.strip()}, Avg={actual_avg.strip()}, RF=ON (continuous)")
         except Exception as e:
             print(f"VNA diagnostic query failed: {e}")
 
-        # Allow VNA to settle after configuration change
-        time.sleep(0.1)
+        # Allow VNA to settle and complete at least one measurement cycle
+        # so the data buffer is populated before first read
+        settle_time = max(0.2, 2.0 / ifbw + 0.1)
+        time.sleep(settle_time)
 
         return True
 
     def trigger_sweep(self):
-        """Trigger a sweep and wait for completion (for CW mode).
+        """Read the latest CW measurement from the continuously-running VNA.
 
-        Uses explicit timing based on IFBW to ensure measurement is complete
-        and data buffer is updated.
+        In continuous mode, the VNA is always measuring and the data buffer
+        always has fresh data. We just wait long enough for one complete
+        measurement cycle to ensure we get a new data point, then read.
         """
         if not self.connected:
             return False
 
-        # Trigger measurement
-        self.write(":INIT:IMM")
-
-        # Wait for measurement to complete based on IFBW
-        # Need to wait for: measurement time + VNA processing + buffer update
+        # Wait for one full measurement cycle to complete
+        # This ensures the data buffer has been updated since we last read
         ifbw = getattr(self, '_cw_ifbw', 100)
         measurement_time = 1.0 / ifbw
-        wait_time = measurement_time * 2.0 + 0.08  # 2x measurement time + 80ms buffer
+        wait_time = measurement_time + 0.04  # 1x measurement time + 40ms processing
         time.sleep(wait_time)
 
         return True
