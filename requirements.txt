@@ -1,0 +1,10 @@
+# VNA FMR Measurement System - Dependencies
+# Install with: pip install -r requirements.txt
+
+numpy
+pandas
+matplotlib
+pyvisa
+
+# Optional: pure-Python VISA backend (if NI-VISA is not installed)
+# pip install pyvisa-py gpib-ctypes

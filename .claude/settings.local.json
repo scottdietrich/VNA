@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(for f in \"C:\\\\Users\\\\2D Materials Lab\\\\Villanova Dropbox\\\\Scott Dietrich\\\\2D Materials Lab Villanova\\\\Laboratory General\\\\Equipment Interface\\\\VNA\"/*.py)",
+      "Bash(done)",
+      "Bash(git init:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
