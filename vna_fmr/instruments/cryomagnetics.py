@@ -21,6 +21,13 @@ class CryomagneticsController:
         self.coil_constant_G_per_A = 2376.5  # Gauss per Amp
         self.field_per_amp = self.coil_constant_G_per_A / 10000.0  # Tesla per Amp
 
+        # Minimum field resolution (from 0.1 mA current granularity)
+        # 0.0001 A * 0.23765 T/A = 0.0000238 T ≈ 0.024 mT
+        self.current_granularity = 0.0001  # Amps (from manual)
+        self.min_field_step = self.current_granularity * self.field_per_amp  # ~0.0000238 T
+        # Practical minimum: 2x hardware limit for settling/noise margin
+        self.min_field_step_practical = self.min_field_step * 2  # ~0.048 mT
+
     def set_address(self, address):
         """Update GPIB address."""
         self.address = f"GPIB0::{address}::INSTR"

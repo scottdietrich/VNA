@@ -471,7 +471,12 @@ class VNAMeasurementApp:
         self.field_ramp_rate = tk.StringVar(value="0.3")
         rate_entry = ttk.Entry(bfield_frame, textvariable=self.field_ramp_rate, width=6)
         rate_entry.grid(row=0, column=1, padx=2, pady=3, sticky='w')
-        ToolTip(rate_entry, "B-field ramp rate in Tesla/minute.\nSCM1 max: 0.3 T/min")
+        ToolTip(rate_entry, "B-field ramp rate in Tesla/minute.\n"
+               "SCM1 max: 0.3 T/min\n\n"
+               "Cryomagnetics 4G field resolution:\n"
+               "  Min step: ~0.024 mT (0.1 mA x 0.238 T/A)\n"
+               "  Practical min: ~0.048 mT\n"
+               "  Points auto-clamped if step too small")
         
         ttk.Label(bfield_frame, text="Tol (T):").grid(row=0, column=2, padx=5, pady=3, sticky='w')
         self.field_tolerance = tk.StringVar(value="0.001")
@@ -748,7 +753,12 @@ class VNAMeasurementApp:
         self.fixed_labels['b_field'].grid(row=row, column=0, padx=10, pady=5, sticky='w')
         self.fixed_entries['b_field'] = ttk.Entry(self.fixed_frame, textvariable=self.fixed_field, width=15)
         self.fixed_entries['b_field'].grid(row=row, column=1, padx=10, pady=5, sticky='w')
-        ToolTip(self.fixed_entries['b_field'], "Range: -18 to +18 T\n(auto-clamped if out of range)")
+        ToolTip(self.fixed_entries['b_field'], "Range: -18 to +18 T\n(auto-clamped if out of range)\n\n"
+               "Cryomagnetics 4G resolution:\n"
+               "  Current granularity: 0.1 mA\n"
+               "  Coil constant: 2376.5 G/A\n"
+               "  Min field step: ~0.024 mT (0.238 G)\n"
+               "  Practical min: ~0.048 mT (2x margin)")
         self.bfield_row = row  # Store row number for show/hide
         
         row += 1
@@ -792,11 +802,15 @@ class VNAMeasurementApp:
         self.bfield_sweep_rate = tk.StringVar(value="0.3")
         sweep_rate_entry = ttk.Entry(bfield_sweep_row, textvariable=self.bfield_sweep_rate, width=8)
         sweep_rate_entry.pack(side='left', padx=5)
-        ToolTip(sweep_rate_entry, 
+        ToolTip(sweep_rate_entry,
                 "Rate for B-field sweeps during measurements.\n"
                 "Maximum limited by IFBW and hardware (0.5 T/min).\n"
                 "No minimum - can be as slow as desired.\n\n"
-                "Note: Tab 1 rate is used for moving between fields.")
+                "Note: Tab 1 rate is used for moving between fields.\n\n"
+                "Field resolution (Cryomagnetics 4G):\n"
+                "  Min step: ~0.024 mT (0.1 mA granularity)\n"
+                "  Practical min: ~0.048 mT\n"
+                "  Points auto-clamped to respect this limit")
         
         # Info label showing if rate will be limited
         self.bfield_sweep_rate_info = ttk.Label(
@@ -2662,11 +2676,15 @@ class VNAMeasurementApp:
             start = float(self.sweep_start.get())
             stop = float(self.sweep_stop.get())
             num_averages = max(1, int(float(self.sweep_averages.get())))
-            
+
+            # Clamp points to respect magnet field resolution
+            self.clamp_bfield_points(self.sweep_start, self.sweep_stop, self.sweep_points, "sweep")
+            points = int(self.sweep_points.get())  # Re-read after potential clamp
+
             # Calculate field step and max rate from VNA
             field_range = abs(stop - start)
             field_step = field_range / max(points - 1, 1)
-            
+
             # Determine mode and timing based on averaging
             if num_averages > 1:
                 # STEPPED MODE: Field stops at each point for N measurements
@@ -2709,6 +2727,51 @@ class VNAMeasurementApp:
             if hasattr(self, 'bfield_sweep_rate_info'):
                 self.bfield_sweep_rate_info.config(text="")
     
+    # Cryomagnetics 4G minimum field step (from 0.1 mA granularity, 2376.5 G/A coil constant)
+    # 0.0001 A * 0.23765 T/A = 0.0000238 T; practical min = 2x = 0.0000475 T
+    BFIELD_MIN_STEP = 0.0000475  # Tesla (~0.048 mT, 2x hardware resolution)
+
+    def clamp_bfield_points(self, start_var, stop_var, points_var, label="sweep"):
+        """Clamp B-field points so the step size respects hardware resolution.
+
+        If the user requests more points than the magnet can resolve,
+        automatically reduce to the maximum meaningful number.
+
+        Args:
+            start_var: tkinter StringVar for start field
+            stop_var: tkinter StringVar for stop field
+            points_var: tkinter StringVar for number of points
+            label: "sweep" or "step" for log messages
+
+        Returns:
+            True if points were clamped, False if no change needed
+        """
+        try:
+            start = float(start_var.get())
+            stop = float(stop_var.get())
+            points = int(float(points_var.get()))
+
+            field_range = abs(stop - start)
+            if field_range == 0 or points <= 1:
+                return False
+
+            step_size = field_range / (points - 1)
+
+            if step_size < self.BFIELD_MIN_STEP:
+                # Calculate max points for this range
+                max_points = int(field_range / self.BFIELD_MIN_STEP) + 1
+                max_points = max(2, max_points)  # At least 2 points
+
+                actual_step = field_range / (max_points - 1)
+                print(f"B-field {label}: {points} points -> {max_points} points "
+                      f"(step {step_size*1000:.4f} mT < min {self.BFIELD_MIN_STEP*1000:.3f} mT, "
+                      f"new step: {actual_step*1000:.4f} mT)")
+                points_var.set(str(max_points))
+                return True
+        except (ValueError, ZeroDivisionError):
+            pass
+        return False
+
     def update_summary(self):
         """Update measurement summary text."""
         sweep = self.sweep_param.get()
@@ -2881,11 +2944,19 @@ class VNAMeasurementApp:
             gate_str = self.fixed_gate.get().strip()
             fixed_gate = float(gate_str) if gate_str else 0.0  # Default 0 V
             
+            # Clamp B-field points to respect hardware resolution
+            if sweep_param == "B-Field (T)":
+                if self.clamp_bfield_points(self.sweep_start, self.sweep_stop, self.sweep_points, "sweep"):
+                    clamped = True
+            if step_param == "B-Field (T)":
+                if self.clamp_bfield_points(self.step_start, self.step_stop, self.step_points, "step"):
+                    clamped = True
+
             # Force GUI update if values were clamped
             if clamped:
                 self.root.update_idletasks()
                 print("Values were clamped to valid ranges")
-            
+
             config = {
                 'sweep_param': sweep_param,
                 'sweep_start': sweep_start,
