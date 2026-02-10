@@ -5,7 +5,17 @@
       "Bash(for f in \"C:\\\\Users\\\\2D Materials Lab\\\\Villanova Dropbox\\\\Scott Dietrich\\\\2D Materials Lab Villanova\\\\Laboratory General\\\\Equipment Interface\\\\VNA\"/*.py)",
       "Bash(done)",
       "Bash(git init:*)",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nInitial commit: VNA FMR Measurement System v0.1 through v3.6\n\nArchive of all version history files for the VNA-based FMR measurement\nsystem \\(Dietrich Lab, Villanova\\). Adds requirements.txt and .gitignore\nfor proper project setup.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\nEOF\n\\)\")",
+      "Bash(git config:*)",
+      "Bash(python:*)",
+      "Bash(python -c:*)",
+      "Bash(where python3)",
+      "Bash(where:*)",
+      "Bash(ls \"C:\\\\Python\"*/python.exe)",
+      "Bash(ls:*)",
+      "Bash(py:*)",
+      "Bash(C:/ProgramData/anaconda3/python.exe -c:*)"
     ]
   }
 }
