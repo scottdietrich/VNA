@@ -167,8 +167,12 @@ class VNAController:
         avg_str = f", {averages}avg" if averages > 1 else ""
         print(f"VNA setup: {f_start/1e9:.3f}-{f_stop/1e9:.3f} GHz, {num_points} pts, IFBW={ifbw}, P={power} dBm{avg_str}")
 
-        # Abort any ongoing operation first
+        # Abort any ongoing operation and stop continuous triggering.
+        # If the VNA was in CW continuous mode, :ABOR alone does not
+        # prevent it from immediately re-triggering. The DSP can hang
+        # if configuration commands arrive while a sweep is active.
         self.write(":ABOR")
+        self.write(":INIT:CONT OFF")
         time.sleep(0.1)
 
         # Set frequency range
@@ -240,8 +244,9 @@ class VNAController:
         # Store IFBW for trigger timing
         self._cw_ifbw = ifbw
 
-        # Abort any ongoing operation
+        # Abort any ongoing operation and stop continuous triggering
         self.write(":ABOR")
+        self.write(":INIT:CONT OFF")
         time.sleep(0.05)
 
         # For CW mode: set start = stop = CW frequency, 1 point
@@ -314,6 +319,9 @@ class VNAController:
     def trigger_sweep_timed(self, num_points, ifbw, averages=1):
         """Trigger sweep and wait for completion.
 
+        Uses time-based waiting.  The S5180B's *OPC? does not block
+        over TCP, so we sleep for the estimated sweep duration.
+
         Args:
             num_points: Number of sweep points
             ifbw: IF bandwidth in Hz
@@ -322,9 +330,9 @@ class VNAController:
         if not self.connected:
             return False
 
-        # Calculate expected sweep time with safety margin
+        # Expected single-sweep time with safety margin
         single_sweep_time = float(num_points) / float(ifbw)
-        adjusted_single_sweep = single_sweep_time * 1.5 + 0.5  # Per-sweep overhead
+        adjusted_single_sweep = single_sweep_time * 1.5 + 0.5
 
         # Make sure RF is on
         self.write(":OUTP ON")
@@ -338,15 +346,14 @@ class VNAController:
             self.write(":SENS:AVER:CLE")
             time.sleep(0.1)
 
-            total_wait = adjusted_single_sweep * averages + 2.0
-            print(f"VNA sweep: {num_points} pts x {averages} avg, est wait {total_wait:.1f}s...")
+            print(f"VNA sweep: {num_points} pts x {averages} avg, "
+                  f"est {adjusted_single_sweep * averages:.0f}s...")
 
             # Trigger N sweeps to accumulate averaging
             for i in range(averages):
                 self.write(":INIT:IMM")
                 time.sleep(adjusted_single_sweep)
 
-                # Brief status every few sweeps
                 if (i + 1) % 5 == 0 or i == averages - 1:
                     print(f"  Averaging: {i + 1}/{averages} sweeps complete")
         else:
@@ -402,8 +409,9 @@ class VNAController:
         if not self.connected:
             return None
 
-        # Ensure any pending operations are complete before reading
-        self.write("*WAI")
+        # Note: *OPC? and *WAI do NOT work on the S5180B over TCP — they
+        # return immediately without waiting.  Sweep completion is verified
+        # in trigger_sweep_timed() via stale-data detection instead.
 
         # Get S-parameter data (real,imag pairs)
         response = self.query(":CALC:DATA:SDAT?", large_data=True)
@@ -487,3 +495,80 @@ class VNAController:
             return None
 
         return self.get_sweep_data()
+
+    def flush_and_reset(self):
+        """Recover the VNA after an interrupted measurement.
+
+        Called after abort/error to leave the VNA in a clean state:
+        1. Drain any unread data from the TCP socket
+        2. Send :ABOR to stop any in-progress sweep
+        3. Restore continuous sweep mode so S2VNA displays live data
+        4. Ensure RF output stays ON
+        """
+        if not self.connected or not self.socket:
+            return
+
+        print("VNA: flushing socket and resetting state...")
+
+        # Step 1: Drain TCP receive buffer (may have partial SDAT response)
+        try:
+            self.socket.setblocking(False)
+            drained = 0
+            while True:
+                try:
+                    chunk = self.socket.recv(65536)
+                    if not chunk:
+                        break
+                    drained += len(chunk)
+                except (BlockingIOError, socket.error):
+                    break
+            self.socket.setblocking(True)
+            self.socket.settimeout(self.timeout)
+            if drained > 0:
+                print(f"  Drained {drained} stale bytes from socket")
+        except Exception as e:
+            print(f"  Socket drain error: {e}")
+            try:
+                self.socket.setblocking(True)
+                self.socket.settimeout(self.timeout)
+            except Exception:
+                pass
+
+        # Step 2: Abort any in-progress sweep
+        try:
+            self.write(":ABOR")
+            time.sleep(0.1)
+        except Exception as e:
+            print(f"  :ABOR error: {e}")
+
+        # Step 3: Restore continuous sweep mode (S2VNA shows live trace)
+        try:
+            self.write(":INIT:CONT ON")
+        except Exception as e:
+            print(f"  :INIT:CONT ON error: {e}")
+
+        # Step 4: Ensure RF output is ON
+        try:
+            self.write(":OUTP ON")
+        except Exception as e:
+            print(f"  :OUTP ON error: {e}")
+
+        # Step 5: Drain again (the above commands may have generated responses)
+        time.sleep(0.2)
+        try:
+            self.socket.setblocking(False)
+            while True:
+                try:
+                    self.socket.recv(65536)
+                except (BlockingIOError, socket.error):
+                    break
+            self.socket.setblocking(True)
+            self.socket.settimeout(self.timeout)
+        except Exception:
+            try:
+                self.socket.setblocking(True)
+                self.socket.settimeout(self.timeout)
+            except Exception:
+                pass
+
+        print("VNA: reset complete")

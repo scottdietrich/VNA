@@ -12,6 +12,9 @@ import pandas as pd
 from .simulation import SimulatedDataGenerator
 from .instruments.gate_safety import GateSafetyWrapper
 
+# EPR resonance constant: mu_B / h in Hz/T
+BOHR_MAGNETON_OVER_H = 13.99624e9  # Hz/T
+
 
 class MeasurementEngine:
     """Handles measurement execution with real or simulated instruments."""
@@ -41,6 +44,7 @@ class MeasurementEngine:
         self.field_ramp_rate_max = 0.3  # T/min - SCM1 limit
         self.field_tolerance = 0.001  # T (10 Gauss)
         self.field_settle_time = 2.0  # seconds
+        self.field_initial_settle_time = 10.0  # seconds - longer settle for first ramp
         self.wait_for_field = True
 
         # VNA settings
@@ -115,6 +119,30 @@ class MeasurementEngine:
         fixed_values = config['fixed_values']
         s_param = config.get('s_parameter', 'S21')
 
+        # EPR tracking configuration
+        epr_tracking = config.get('epr_tracking_enabled', False)
+        epr_g_factor = config.get('epr_g_factor', 2.0)
+        epr_span_value = config.get('epr_span', 0.0)
+        epr_gamma = epr_g_factor * BOHR_MAGNETON_OVER_H  # Hz/T
+
+        # EPR tracking: pre-compute full frequency range (union of all tracking windows)
+        # The VNA will be configured to this full range once and NOT reconfigured per step,
+        # ensuring identical standing wave patterns for clean normalization.
+        epr_full_start = None
+        epr_full_stop = None
+        epr_full_points = None
+        epr_full_freqs = None
+
+        if epr_tracking:
+            print(f"=== EPR Tracking Mode ===")
+            print(f"  g-factor: {epr_g_factor}")
+            print(f"  gamma: {epr_gamma/1e9:.4f} GHz/T")
+            if sweep_param == "Frequency (GHz)":
+                print(f"  Span: {epr_span_value} GHz")
+            else:
+                print(f"  Span: {epr_span_value} T")
+            print(f"========================")
+
         # Generate sweep arrays
         sweep_values = np.linspace(sweep_start, sweep_stop, sweep_points)
 
@@ -125,6 +153,55 @@ class MeasurementEngine:
         else:
             step_values = [None]
             is_2d = False
+
+        # EPR tracking: compute full frequency range (union of all tracking windows)
+        # Include the field normalization reference field if enabled, so reference
+        # and all step measurements use the same VNA configuration (identical standing waves).
+        if epr_tracking and sweep_param == "Frequency (GHz)" and step_param == "B-Field (T)":
+            span_hz = epr_span_value * 1e9
+            all_b_fields = list(step_values)
+            # Include normalization reference field if enabled
+            field_norm_ref = config.get('field_normalization_field', None)
+            if config.get('field_normalization_enabled', False) and field_norm_ref is not None:
+                all_b_fields.append(field_norm_ref)
+            all_starts = [(epr_gamma * b) - span_hz / 2.0 for b in all_b_fields]
+            all_stops = [(epr_gamma * b) + span_hz / 2.0 for b in all_b_fields]
+            epr_full_start = min(all_starts)
+            epr_full_stop = max(all_stops)
+            # Scale points to maintain frequency resolution
+            full_span = epr_full_stop - epr_full_start
+            epr_full_points = max(sweep_points, int(sweep_points * full_span / span_hz) + 1)
+            epr_full_freqs = np.linspace(epr_full_start, epr_full_stop, epr_full_points)
+            print(f"[EPR Track] Full VNA range: {epr_full_start/1e9:.4f}-{epr_full_stop/1e9:.4f} GHz "
+                  f"({epr_full_points} pts, fixed for all steps)")
+
+        # Auto-clamp field tolerance when B-field step size is too small
+        # The tolerance must be smaller than the step size for stepping to resolve each point
+        field_involved = (sweep_param == "B-Field (T)" or step_param == "B-Field (T)")
+        if field_involved:
+            if step_param == "B-Field (T)" and step_points > 1:
+                bfield_step_size = abs(step_stop - step_start) / (step_points - 1)
+            elif sweep_param == "B-Field (T)" and sweep_points > 1:
+                bfield_step_size = abs(sweep_stop - sweep_start) / (sweep_points - 1)
+            else:
+                bfield_step_size = None
+
+            # Minimum tolerance floor: must be above field READING quantization.
+            # IMAG? returns field to nearest 0.0001 T (0.1 mT). Tolerance must
+            # exceed this so "diff: 0.0001" always counts as "reached".
+            min_tolerance = 0.00015  # 0.15 mT - 1.5x the 0.1 mT read quantization
+
+            if bfield_step_size is not None and self.field_tolerance >= bfield_step_size:
+                old_tol = self.field_tolerance
+                # Clamp to half the step size, but never below hardware noise floor
+                self.field_tolerance = max(bfield_step_size / 2.0, min_tolerance)
+                print(f"WARNING: Field tolerance {old_tol:.4f} T >= step size {bfield_step_size:.4f} T")
+                print(f"  Auto-clamped tolerance to {self.field_tolerance:.6f} T ({self.field_tolerance*1000:.3f} mT)")
+
+            if self.field_tolerance < min_tolerance:
+                print(f"WARNING: Field tolerance {self.field_tolerance:.6f} T below hardware noise floor")
+                self.field_tolerance = min_tolerance
+                print(f"  Clamped to minimum {min_tolerance:.6f} T ({min_tolerance*1000:.3f} mT)")
 
         # Determine if we can use fast VNA sweep mode
         # (only for frequency sweeps when VNA is connected)
@@ -192,11 +269,16 @@ class MeasurementEngine:
                 # Get number of averages for hardware averaging
                 num_averages = config.get('averages', 1)
 
-                print(f"Initial VNA sweep config: {sweep_start}-{sweep_stop} Hz, {sweep_points} pts, "
+                # EPR tracking: use full union range so VNA is never reconfigured
+                vna_start = epr_full_start if epr_full_start is not None else sweep_start
+                vna_stop = epr_full_stop if epr_full_stop is not None else sweep_stop
+                vna_points = epr_full_points if epr_full_points is not None else sweep_points
+
+                print(f"Initial VNA sweep config: {vna_start}-{vna_stop} Hz, {vna_points} pts, "
                       f"IFBW={fixed_values.get('ifbw', 100)}, Power={initial_power} dBm, Avg={num_averages}")
 
                 self.vna.setup_frequency_sweep(
-                    sweep_start, sweep_stop, sweep_points,
+                    vna_start, vna_stop, vna_points,
                     fixed_values.get('ifbw', 100),
                     initial_power,
                     num_averages
@@ -234,9 +316,13 @@ class MeasurementEngine:
 
         # Track if B-field is involved (for field normalization)
         field_involved = (sweep_param == "B-Field (T)" or step_param == "B-Field (T)")
+        # Fixed-mode: field norm uses magnet even though B-field isn't sweep/step
+        field_normalization_fixed_mode = config.get('field_normalization_fixed_mode', False)
+        # Fixed-mode: gate norm uses SMU even though gate isn't sweep/step
+        gate_normalization_fixed_mode = config.get('gate_normalization_fixed_mode', False)
 
         # START GATE SAFETY MONITORING
-        if gate_involved:
+        if gate_involved or gate_normalization_fixed_mode:
             self.gate_safety.start_measurement()
 
         # === GATE NORMALIZATION REFERENCE MEASUREMENT ===
@@ -249,7 +335,7 @@ class MeasurementEngine:
         per_step_reference = False  # Flag for gate sweep with freq step (reference taken at each step)
         step_reference_db = {}  # Dictionary to store per-step reference values
 
-        if normalization_enabled and gate_involved:
+        if normalization_enabled and (gate_involved or gate_normalization_fixed_mode):
             print(f"=== Taking reference measurement at V_gate = {normalization_voltage}V ===")
 
             # Check if we need to ramp to reference voltage
@@ -369,6 +455,77 @@ class MeasurementEngine:
                 else:
                     print("  WARNING: Failed to get reference spectrum!")
 
+            elif gate_normalization_fixed_mode and sweep_param == "Frequency (GHz)":
+                # Fixed gate mode with frequency sweep: take full spectrum at reference voltage,
+                # then ramp back to fixed V_gate. Mirrors field_normalization_fixed_mode.
+                fixed_gate = fixed_values.get('vg', 0)
+                print(f"  [Fixed gate mode] Taking reference spectrum at {normalization_voltage}V...")
+                num_averages = config.get('averages', 1)
+                ifbw = fixed_values.get('ifbw', 100)
+
+                if self.use_simulation:
+                    ref_spectrum = self.sim_data.generate_s21_vs_frequency(
+                        sweep_values,
+                        fixed_values.get('b_field', 0),
+                        normalization_voltage,
+                        fixed_values.get('power', -10),
+                        300.0
+                    )
+                else:
+                    print(f"  Triggering reference sweep with {num_averages} averages...")
+                    if not self.vna.trigger_sweep_timed(sweep_points, ifbw, num_averages):
+                        print("  WARNING: VNA trigger for reference sweep returned False")
+                    ref_spectrum = self.vna.get_sweep_data(expected_points=sweep_points)
+
+                if ref_spectrum is not None and len(ref_spectrum) > 0:
+                    reference_spectrum_mag_db = 20 * np.log10(np.abs(ref_spectrum) + 1e-12)
+                    print(f"  Reference spectrum: {len(reference_spectrum_mag_db)} points, "
+                          f"range {np.min(reference_spectrum_mag_db):.1f} to {np.max(reference_spectrum_mag_db):.1f} dB")
+                else:
+                    print("  WARNING: Failed to get reference spectrum!")
+
+                # Ramp gate back to fixed voltage
+                if not self.use_simulation and self.keithley.connected:
+                    print(f"  Ramping gate back to fixed voltage {fixed_gate}V...")
+                    self.keithley.ramp_to_voltage(
+                        fixed_gate,
+                        slew_rate=self.gate_slew_rate,
+                        stop_check=self.stop_check
+                    )
+                    time.sleep(0.5)  # Settle at fixed voltage
+
+            elif gate_normalization_fixed_mode:
+                # Fixed gate mode with non-frequency sweep: take single CW reference,
+                # then ramp back to fixed V_gate.
+                fixed_gate = fixed_values.get('vg', 0)
+                print(f"  [Fixed gate mode] Taking CW reference at {normalization_voltage}V...")
+
+                if self.use_simulation:
+                    ref_s21 = self.sim_data.generate_s21_vs_gate(
+                        np.array([normalization_voltage]),
+                        fixed_values.get('frequency', 8e9),
+                        fixed_values.get('b_field', 0),
+                        fixed_values.get('power', -10),
+                        300.0
+                    )[0]
+                else:
+                    self.vna.trigger_sweep()
+                    ref_s21 = self.vna.get_cw_data()
+
+                if ref_s21 is not None:
+                    reference_s21_mag_db = 20 * np.log10(np.abs(ref_s21) + 1e-12)
+                    print(f"  Reference S21 at {normalization_voltage}V: {reference_s21_mag_db:.2f} dB")
+
+                # Ramp gate back to fixed voltage
+                if not self.use_simulation and self.keithley.connected:
+                    print(f"  Ramping gate back to fixed voltage {fixed_gate}V...")
+                    self.keithley.ramp_to_voltage(
+                        fixed_gate,
+                        slew_rate=self.gate_slew_rate,
+                        stop_check=self.stop_check
+                    )
+                    time.sleep(0.5)  # Settle at fixed voltage
+
             # Send reference data to GUI for storage/saving (skip for per-step mode - will send later)
             if not per_step_reference:
                 self.data_queue.put({
@@ -386,21 +543,22 @@ class MeasurementEngine:
         field_normalization_field = config.get('field_normalization_field', 0.0)
         field_reference_s21_mag_db = None  # Single value for field sweeps
         field_reference_spectrum_mag_db = None  # Full spectrum for freq sweeps with field step
+        field_reference_frequencies = None  # Frequency grid of the reference (may differ from sweep when EPR tracking)
         field_per_step_reference = False  # Flag for field sweep with freq step
         field_step_reference_db = {}  # Dictionary to store per-step reference values
 
-        if field_normalization_enabled and field_involved:
+        if field_normalization_enabled and (field_involved or field_normalization_fixed_mode):
             print(f"=== Taking reference measurement at B = {field_normalization_field}T ===")
 
             # Ramp to reference field
             if not self.use_simulation and self.magnet.connected:
                 current_b = self.magnet.get_field()
-                if abs(current_b - field_normalization_field) > 0.001:
+                if abs(current_b - field_normalization_field) > self.field_tolerance:
                     print(f"  Ramping magnet to reference field {field_normalization_field}T...")
                     self.magnet.set_field(field_normalization_field)
 
                     # Wait for field to stabilize
-                    field_tol = 0.01  # Default tolerance
+                    field_tol = self.field_tolerance
                     max_wait = 600  # 10 minute timeout for field ramp
                     start_time = time.time()
 
@@ -415,8 +573,9 @@ class MeasurementEngine:
                     else:
                         print(f"  WARNING: Timeout waiting for field to reach {field_normalization_field}T")
 
-                    # Settle time after reaching field
-                    time.sleep(2.0)
+                    # Longer settle for first ramp to reference field
+                    print(f"  Initial settle for {self.field_initial_settle_time}s...")
+                    time.sleep(self.field_initial_settle_time)
                 else:
                     print(f"  Already at reference field {current_b:.4f}T")
 
@@ -426,21 +585,38 @@ class MeasurementEngine:
                     'all_data': [],
                     'config': config
                 })
-                if gate_involved:
+                if gate_involved or gate_normalization_fixed_mode:
                     self.gate_safety.end_measurement()
                 self.is_running = False
                 return
 
+            # Reference frequency range: use EPR full range if tracking, else original sweep
+            if epr_full_freqs is not None:
+                ref_sweep_start = epr_full_start
+                ref_sweep_stop = epr_full_stop
+                ref_sweep_points = epr_full_points
+                print(f"  [EPR Track] Reference uses same full VNA range: "
+                      f"{ref_sweep_start/1e9:.4f}-{ref_sweep_stop/1e9:.4f} GHz "
+                      f"({ref_sweep_points} pts)")
+                # VNA is already configured to this range — no reconfiguration needed
+            else:
+                ref_sweep_start = sweep_start
+                ref_sweep_stop = sweep_stop
+                ref_sweep_points = sweep_points
+
             # Configure VNA for reference measurement if needed
             if not self.use_simulation and self.vna.connected:
-                if sweep_param == "Frequency (GHz)":
-                    # Need full frequency sweep for reference
+                if sweep_param == "Frequency (GHz)" and epr_full_freqs is not None:
+                    # EPR tracking: VNA is already configured to full union range — skip
+                    print(f"  VNA already at full EPR range — no reconfiguration for reference")
+                elif sweep_param == "Frequency (GHz)":
+                    # Non-tracking frequency sweep: configure for reference sweep
                     num_averages = config.get('averages', 1)
                     initial_power = fixed_values.get('power', -10)
 
                     print(f"  Configuring VNA for reference sweep...")
                     self.vna.setup_frequency_sweep(
-                        sweep_start, sweep_stop, sweep_points,
+                        ref_sweep_start, ref_sweep_stop, ref_sweep_points,
                         fixed_values.get('ifbw', 100),
                         initial_power,
                         num_averages
@@ -455,10 +631,47 @@ class MeasurementEngine:
 
             # Take reference measurement based on sweep type
             if sweep_param == "B-Field (T)" and step_param == "Frequency (GHz)":
-                # Field sweep with frequency step: references taken per-step
+                # Field sweep with frequency step: take CW reference at each step frequency
+                # while magnet is at the reference field
                 field_per_step_reference = True
-                print(f"  Per-step reference mode: will take CW reference at {field_normalization_field}T for each frequency")
                 field_step_reference_db = {}
+                print(f"  Per-step reference mode: taking CW reference at {field_normalization_field}T for each frequency...")
+
+                for ref_step_idx, ref_freq in enumerate(step_values):
+                    if self.should_stop:
+                        break
+                    print(f"    Ref {ref_step_idx+1}/{len(step_values)}: f={ref_freq/1e9:.4f} GHz")
+
+                    if self.use_simulation:
+                        ref_s21 = self.sim_data.generate_s21_vs_field(
+                            np.array([field_normalization_field]),
+                            ref_freq,
+                            fixed_values.get('vg', 0),
+                            fixed_values.get('power', -10),
+                            300.0
+                        )[0]
+                    else:
+                        # Configure VNA to CW at this frequency
+                        self.vna.setup_cw_mode(
+                            ref_freq,
+                            fixed_values.get('ifbw', 100),
+                            fixed_values.get('power', -10)
+                        )
+                        # Flush stale data with two dummy reads
+                        self.vna.trigger_sweep()
+                        self.vna.trigger_sweep()
+                        # Actual reference measurement
+                        self.vna.trigger_sweep()
+                        ref_s21 = self.vna.get_cw_data()
+
+                    if ref_s21 is not None:
+                        ref_db = 20 * np.log10(np.abs(ref_s21) + 1e-12)
+                        field_step_reference_db[ref_step_idx] = ref_db
+                        print(f"      S21 = {ref_db:.2f} dB")
+                    else:
+                        print(f"      WARNING: Failed to get reference!")
+
+                print(f"  Collected {len(field_step_reference_db)}/{len(step_values)} per-step references")
 
             elif sweep_param == "B-Field (T)":
                 # Field sweep (no freq step): take single CW measurement at reference field
@@ -482,10 +695,49 @@ class MeasurementEngine:
 
             elif sweep_param == "Frequency (GHz)" and step_param == "B-Field (T)":
                 # Freq sweep with field step: take full spectrum at reference field
+                # When EPR tracking is active, the VNA was configured to cover the
+                # union of all tracking windows (ref_sweep_start..ref_sweep_stop with
+                # ref_sweep_points), so the reference grid differs from per-step grids.
                 print(f"  Taking reference spectrum at {field_normalization_field}T...")
                 num_averages = config.get('averages', 1)
                 ifbw = fixed_values.get('ifbw', 100)
-                print(f"  Reference sweep params: {sweep_points} points, IFBW={ifbw}, averages={num_averages}")
+                actual_ref_points = ref_sweep_points if epr_tracking else sweep_points
+                print(f"  Reference sweep params: {actual_ref_points} points, IFBW={ifbw}, averages={num_averages}")
+
+                # Build the reference frequency grid
+                if epr_tracking:
+                    field_reference_frequencies = np.linspace(ref_sweep_start, ref_sweep_stop, actual_ref_points)
+                    ref_freq_grid = field_reference_frequencies
+                else:
+                    ref_freq_grid = sweep_values
+
+                if self.use_simulation:
+                    ref_spectrum = self.sim_data.generate_s21_vs_frequency(
+                        ref_freq_grid,
+                        field_normalization_field,
+                        fixed_values.get('vg', 0),
+                        fixed_values.get('power', -10),
+                        300.0
+                    )
+                else:
+                    # Trigger VNA sweep for reference (with full averaging)
+                    print(f"  Triggering reference sweep with {num_averages} averages...")
+                    if not self.vna.trigger_sweep_timed(actual_ref_points, ifbw, num_averages):
+                        print("  WARNING: VNA trigger for reference sweep returned False")
+                    ref_spectrum = self.vna.get_sweep_data(expected_points=actual_ref_points)
+
+                if ref_spectrum is not None and len(ref_spectrum) > 0:
+                    field_reference_spectrum_mag_db = 20 * np.log10(np.abs(ref_spectrum) + 1e-12)
+                    print(f"  Reference spectrum: {len(field_reference_spectrum_mag_db)} points, "
+                          f"range {np.min(field_reference_spectrum_mag_db):.1f} to {np.max(field_reference_spectrum_mag_db):.1f} dB")
+                else:
+                    print("  WARNING: Failed to get reference spectrum!")
+
+            elif field_normalization_fixed_mode and sweep_param == "Frequency (GHz)":
+                # Fixed B-field mode: take full frequency spectrum at reference field
+                print(f"  [Fixed B-field mode] Taking reference spectrum at {field_normalization_field}T...")
+                num_averages = config.get('averages', 1)
+                ifbw = fixed_values.get('ifbw', 100)
 
                 if self.use_simulation:
                     ref_spectrum = self.sim_data.generate_s21_vs_frequency(
@@ -496,7 +748,6 @@ class MeasurementEngine:
                         300.0
                     )
                 else:
-                    # Trigger VNA sweep for reference (with full averaging)
                     print(f"  Triggering reference sweep with {num_averages} averages...")
                     if not self.vna.trigger_sweep_timed(sweep_points, ifbw, num_averages):
                         print("  WARNING: VNA trigger for reference sweep returned False")
@@ -509,17 +760,89 @@ class MeasurementEngine:
                 else:
                     print("  WARNING: Failed to get reference spectrum!")
 
+            elif field_normalization_fixed_mode:
+                # Fixed B-field mode with non-frequency sweep: take single CW reference
+                print(f"  [Fixed B-field mode] Taking CW reference at {field_normalization_field}T...")
+                if self.use_simulation:
+                    ref_s21 = self.sim_data.generate_s21_vs_field(
+                        np.array([field_normalization_field]),
+                        fixed_values.get('frequency', 8e9),
+                        fixed_values.get('vg', 0),
+                        fixed_values.get('power', -10),
+                        300.0
+                    )[0]
+                else:
+                    self.vna.trigger_sweep()
+                    ref_s21 = self.vna.get_cw_data()
+
+                if ref_s21 is not None:
+                    field_reference_s21_mag_db = 20 * np.log10(np.abs(ref_s21) + 1e-12)
+                    print(f"  Reference S21 at {field_normalization_field}T: {field_reference_s21_mag_db:.2f} dB")
+
             # Send field reference data to GUI for storage/saving
-            if not field_per_step_reference:
+            if field_per_step_reference:
+                # Send per-step CW references (one value per frequency step)
+                self.data_queue.put({
+                    'type': 'field_reference_data',
+                    'field': field_normalization_field,
+                    'single_value_db': None,
+                    'spectrum_db': [field_step_reference_db.get(i) for i in range(len(step_values))],
+                    'frequencies': [sv / 1e9 for sv in step_values],  # GHz for display
+                    'per_step': True
+                })
+            else:
+                ref_freqs_for_gui = field_reference_frequencies if field_reference_frequencies is not None else sweep_values
                 self.data_queue.put({
                     'type': 'field_reference_data',
                     'field': field_normalization_field,
                     'single_value_db': field_reference_s21_mag_db,
                     'spectrum_db': field_reference_spectrum_mag_db.tolist() if field_reference_spectrum_mag_db is not None else None,
-                    'frequencies': sweep_values.tolist() if field_reference_spectrum_mag_db is not None else None
+                    'frequencies': ref_freqs_for_gui.tolist() if field_reference_spectrum_mag_db is not None else None
                 })
 
             print(f"=== Field reference measurement complete ===")
+            # Note: VNA stays at full range when EPR tracking — no reconfiguration needed
+
+            # If in fixed B-field mode, ramp BACK to the fixed B-field
+            if field_normalization_fixed_mode:
+                target_fixed_field = fixed_values.get('b_field', 0.0)
+                if not self.use_simulation and self.magnet.connected:
+                    current_b = self.magnet.get_field()
+                    if abs(current_b - target_fixed_field) > self.field_tolerance:
+                        print(f"  Ramping back to fixed B-field {target_fixed_field:.4f}T...")
+                        self.magnet.set_field(target_fixed_field)
+
+                        start_time = time.time()
+                        max_wait = 600
+                        while time.time() - start_time < max_wait:
+                            if self.should_stop:
+                                break
+                            current_b = self.magnet.get_field()
+                            if abs(current_b - target_fixed_field) <= self.field_tolerance:
+                                print(f"  Field reached: {current_b:.4f}T")
+                                break
+                            time.sleep(0.5)
+                        else:
+                            print(f"  WARNING: Timeout ramping back to {target_fixed_field:.4f}T")
+                        time.sleep(self.field_settle_time)
+                    else:
+                        print(f"  Already at fixed B-field {current_b:.4f}T")
+
+        # === FREQUENCY NORMALIZATION (interleaved) ===
+        # For B-field sweeps: at each field point, measure at reference freq then at
+        # measurement freq, and subtract.  No pre-sweep reference needed.
+        freq_normalization_enabled = config.get('freq_normalization_enabled', False)
+        freq_normalization_freq = config.get('freq_normalization_freq', 0.0)  # Hz
+        if freq_normalization_enabled and sweep_param == "B-Field (T)" and freq_normalization_freq > 0:
+            print(f"=== Frequency normalization enabled: ref freq = {freq_normalization_freq/1e9:.4g} GHz ===")
+            print(f"  Will interleave CW measurements at ref freq at each field point")
+            # Notify GUI of the reference frequency
+            self.data_queue.put({
+                'type': 'freq_reference_data',
+                'frequency': freq_normalization_freq
+            })
+        else:
+            freq_normalization_enabled = False  # Disable if conditions not met
 
         # Pre-sweep: Ramp gate voltage to start position (NEVER jump!)
         if gate_involved and (not self.use_simulation or self.keithley.connected):
@@ -565,21 +888,30 @@ class MeasurementEngine:
                 time.sleep(0.5)
 
         try:
-            # Final flush right before starting measurements
-            # This clears any data that accumulated during gate ramp
-            if not self.use_simulation and self.vna.connected:
-                print("Final VNA buffer flush before measurement loop...")
-                for i in range(2):
-                    try:
-                        _ = self._get_real_data()
-                        time.sleep(0.02)
-                    except:
-                        pass
+            # Note: the old "2 dummy flush sweeps" were removed.
+            # trigger_sweep_timed() now detects stale data via buffer
+            # fingerprinting and retries automatically.
 
             # Global target field grid for 2D measurements.
             # Set by the first sweep's actual recorded range, then reused
             # by all subsequent sweeps to ensure identical field axes.
             global_target_fields = None
+
+            # Pre-compute B-field direction to avoid noisy field readings
+            # causing ramp direction reversals during monotonic sequences
+            field_step_direction = None
+            if is_2d and step_param == "B-Field (T)" and len(step_values) >= 2:
+                if step_values[-1] < step_values[0]:
+                    field_step_direction = 'down'
+                elif step_values[-1] > step_values[0]:
+                    field_step_direction = 'up'
+
+            field_sweep_direction = None
+            if sweep_param == "B-Field (T)":
+                if sweep_stop > sweep_start:
+                    field_sweep_direction = 'up'
+                elif sweep_stop < sweep_start:
+                    field_sweep_direction = 'down'
 
             for step_idx, step_val in enumerate(step_values):
                 if self.should_stop:
@@ -629,9 +961,49 @@ class MeasurementEngine:
 
                         # Set parameter (skip gate voltage - already ramped above)
                         if step_param != "Gate Voltage (V)":
-                            self._set_parameter(step_param, step_val, fixed_values, is_step=True)
+                            # For the first step, let the driver determine direction from
+                            # the actual field (may need opposite direction after reference)
+                            first_step_dir = None if step_idx == 0 else field_step_direction
+                            self._set_parameter(step_param, step_val, fixed_values, is_step=True,
+                                                field_direction=first_step_dir)
+
+                    # Extra settle time for first step (magnet stabilization from cold start)
+                    if step_idx == 0 and step_param == "B-Field (T)":
+                        extra = self.field_initial_settle_time - self.field_settle_time
+                        if extra > 0:
+                            print(f"  Extra initial settle for {extra:.1f}s...")
+                            time.sleep(extra)
 
                     time.sleep(0.1)  # Settling time for step parameter
+
+                # === EPR TRACKING: Compute sweep range for this step ===
+                # VNA is NOT reconfigured — it stays at the full union range.
+                # We compute the per-step window and extract the subset after measurement.
+                if epr_tracking and step_val is not None:
+                    if sweep_param == "Frequency (GHz)" and step_param == "B-Field (T)":
+                        # Config 1: Frequency sweep, B-field step
+                        f_center = epr_gamma * step_val  # Hz
+                        span_hz = epr_span_value * 1e9    # GHz -> Hz
+                        new_start = f_center - span_hz / 2.0
+                        new_stop = f_center + span_hz / 2.0
+
+                        sweep_values = np.linspace(new_start, new_stop, sweep_points)
+
+                        print(f"  [EPR Track] B={step_val:.4f}T -> f_center={f_center/1e9:.4f} GHz, "
+                              f"range={new_start/1e9:.4f}-{new_stop/1e9:.4f} GHz")
+                        # VNA stays at full range — subset extracted after sweep
+
+                    elif sweep_param == "B-Field (T)" and step_param == "Frequency (GHz)":
+                        # Config 2: B-field sweep, Frequency step
+                        b_center = step_val / epr_gamma  # Tesla (step_val is Hz)
+                        span_t = epr_span_value           # Already in Tesla
+                        new_start = b_center - span_t / 2.0
+                        new_stop = b_center + span_t / 2.0
+
+                        sweep_values = np.linspace(new_start, new_stop, sweep_points)
+
+                        print(f"  [EPR Track] f={step_val/1e9:.4f} GHz -> B_center={b_center:.4f}T, "
+                              f"range={new_start:.4f}-{new_stop:.4f} T")
 
                 # Temperature reading DISABLED - Lakeshore causes GPIB conflicts
                 sweep_temperature_k = None
@@ -648,55 +1020,107 @@ class MeasurementEngine:
                     num_averages = config.get('averages', 1)
                     ifbw = fixed_values.get('ifbw', 100)
 
+                    # When EPR tracking, VNA is at full range (epr_full_points)
+                    vna_expected_pts = epr_full_points if epr_full_freqs is not None else sweep_points
+
                     if num_averages > 1:
                         print(f"Running VNA sweep {step_idx + 1}/{len(step_values)} with {num_averages}x hardware averaging...")
                     else:
                         print(f"Running VNA sweep {step_idx + 1}/{len(step_values)}...")
 
                     # Trigger VNA sweep (VNA handles averaging internally)
-                    if not self.vna.trigger_sweep_timed(sweep_points, ifbw, num_averages):
+                    if not self.vna.trigger_sweep_timed(vna_expected_pts, ifbw, num_averages):
                         print("Warning: VNA trigger_sweep_timed returned False")
 
                     # Get averaged data from VNA
-                    s21_array = self.vna.get_sweep_data(expected_points=sweep_points)
+                    s21_array = self.vna.get_sweep_data(expected_points=vna_expected_pts)
 
                     if s21_array is None:
                         print(f"Warning: VNA returned None")
-                        s21_array = np.zeros(sweep_points, dtype=complex)
-                    elif len(s21_array) != sweep_points:
-                        print(f"Warning: VNA returned {len(s21_array)} points, expected {sweep_points}")
+                        s21_array = np.zeros(vna_expected_pts, dtype=complex)
+                    elif len(s21_array) != vna_expected_pts:
+                        print(f"Warning: VNA returned {len(s21_array)} points, expected {vna_expected_pts}")
                         # Pad or truncate to expected size
-                        if len(s21_array) < sweep_points:
-                            s21_array = np.pad(s21_array, (0, sweep_points - len(s21_array)))
+                        if len(s21_array) < vna_expected_pts:
+                            s21_array = np.pad(s21_array, (0, vna_expected_pts - len(s21_array)))
                         else:
-                            s21_array = s21_array[:sweep_points]
+                            s21_array = s21_array[:vna_expected_pts]
 
                     print(f"Got {len(s21_array)} points from VNA" + (f" ({num_averages}x averaged)" if num_averages > 1 else ""))
 
-                    # Build sweep_data from averaged result
-                    for sweep_idx, (sweep_val, s21) in enumerate(zip(sweep_values, s21_array)):
-                        if self.should_stop:
-                            break
+                    # EPR tracking: extract per-step subset from full-range data
+                    # Normalization is done on the full grid (index-based = same frequencies),
+                    # then interpolated to the step's window for display/storage.
+                    if epr_full_freqs is not None and sweep_param == "Frequency (GHz)":
+                        # Compute magnitude on full grid
+                        full_mag_db = 20 * np.log10(np.abs(s21_array) + 1e-12)
 
-                        s21_mag_db = 20 * np.log10(np.abs(s21) + 1e-12)
+                        # Normalize on full grid (index-based, identical frequencies)
+                        full_norm = None
+                        if field_reference_spectrum_mag_db is not None:
+                            full_norm = full_mag_db - field_reference_spectrum_mag_db
 
-                        # Calculate normalized value if reference spectrum available
-                        # Check gate reference first, then field reference
-                        s21_mag_db_norm = None
-                        if reference_spectrum_mag_db is not None and sweep_idx < len(reference_spectrum_mag_db):
-                            s21_mag_db_norm = s21_mag_db - reference_spectrum_mag_db[sweep_idx]
-                        elif field_reference_spectrum_mag_db is not None and sweep_idx < len(field_reference_spectrum_mag_db):
-                            s21_mag_db_norm = s21_mag_db - field_reference_spectrum_mag_db[sweep_idx]
+                        # Interpolate full-grid data to this step's window
+                        step_mag_db = np.interp(sweep_values, epr_full_freqs, full_mag_db)
+                        step_s21_complex = np.array([
+                            np.interp(sweep_values, epr_full_freqs, np.real(s21_array)) +
+                            1j * np.interp(sweep_values, epr_full_freqs, np.imag(s21_array))
+                        ]).flatten()
+                        step_norm = None
+                        if full_norm is not None:
+                            step_norm = np.interp(sweep_values, epr_full_freqs, full_norm)
 
-                        sweep_data.append({
-                            'sweep_value': sweep_val,
-                            'step_value': step_val,
-                            's21_real': np.real(s21),
-                            's21_imag': np.imag(s21),
-                            's21_mag': np.abs(s21),
-                            's21_phase': np.angle(s21, deg=True),
-                            's21_mag_db_norm': s21_mag_db_norm  # Normalized to reference (None if no ref)
-                        })
+                        # Build sweep_data from extracted subset
+                        for sweep_idx, sweep_val in enumerate(sweep_values):
+                            if self.should_stop:
+                                break
+                            s21 = step_s21_complex[sweep_idx]
+                            s21_mag_db_norm = step_norm[sweep_idx] if step_norm is not None else None
+
+                            # Also check gate reference
+                            if reference_spectrum_mag_db is not None and sweep_idx < len(reference_spectrum_mag_db):
+                                s21_mag_db_norm = step_mag_db[sweep_idx] - reference_spectrum_mag_db[sweep_idx]
+
+                            sweep_data.append({
+                                'sweep_value': sweep_val,
+                                'step_value': step_val,
+                                's21_real': np.real(s21),
+                                's21_imag': np.imag(s21),
+                                's21_mag': np.abs(s21),
+                                's21_phase': np.angle(s21, deg=True),
+                                's21_mag_db_norm': s21_mag_db_norm
+                            })
+                    else:
+                        # Non-tracking path: direct index-based processing
+                        # Build sweep_data from averaged result
+                        for sweep_idx, (sweep_val, s21) in enumerate(zip(sweep_values, s21_array)):
+                            if self.should_stop:
+                                break
+
+                            s21_mag_db = 20 * np.log10(np.abs(s21) + 1e-12)
+
+                            # Calculate normalized value if reference spectrum available
+                            # Check gate reference first, then field reference
+                            s21_mag_db_norm = None
+                            if reference_spectrum_mag_db is not None and sweep_idx < len(reference_spectrum_mag_db):
+                                s21_mag_db_norm = s21_mag_db - reference_spectrum_mag_db[sweep_idx]
+                            elif field_reference_spectrum_mag_db is not None:
+                                if field_reference_frequencies is not None:
+                                    ref_val = np.interp(sweep_val, field_reference_frequencies,
+                                                        field_reference_spectrum_mag_db)
+                                    s21_mag_db_norm = s21_mag_db - ref_val
+                                elif sweep_idx < len(field_reference_spectrum_mag_db):
+                                    s21_mag_db_norm = s21_mag_db - field_reference_spectrum_mag_db[sweep_idx]
+
+                            sweep_data.append({
+                                'sweep_value': sweep_val,
+                                'step_value': step_val,
+                                's21_real': np.real(s21),
+                                's21_imag': np.imag(s21),
+                                's21_mag': np.abs(s21),
+                                's21_phase': np.angle(s21, deg=True),
+                                's21_mag_db_norm': s21_mag_db_norm
+                            })
 
                     # Update progress
                     progress = (step_idx + 1) / len(step_values) * 100
@@ -749,29 +1173,40 @@ class MeasurementEngine:
 
                     # Clear any errors and make sure we're in simple DC mode
                     self.keithley.instrument.write('*CLS')
-                    self.keithley.instrument.write(':ABOR')
-                    time.sleep(0.05)
 
-                    # Disable automatic measurements that slow down voltage changes
-                    self.keithley.instrument.write(':OUTP OFF')
-                    time.sleep(0.05)
-                    self.keithley.instrument.write(':SENS:FUNC "CURR"')
-                    self.keithley.instrument.write(':SENS:CURR:NPLC 0.01')
-                    self.keithley.instrument.write(':SENS:CURR:RANG:AUTO OFF')  # Disable current auto-range
-                    self.keithley.instrument.write(f':SENS:CURR:RANG {self.keithley.compliance_current}')  # Match sense range to compliance
+                    if not self.keithley.is_bk:
+                        # ── Keithley 2400/2450 fast-sweep configuration ──
+                        # None of the following commands apply to the BK 9132B,
+                        # which has no NPLC / autozero / sense-range / display
+                        # settings. The BK is already configured (channel
+                        # selected, compliance set, output ON) at connect time.
+                        self.keithley.instrument.write(':ABOR')
+                        time.sleep(0.05)
 
-                    # Model-specific commands
-                    if self.keithley.model == '2450':
-                        self.keithley.instrument.write(':SOUR:DEL 0')  # 2450: source delay
-                        self.keithley.instrument.write(':SYST:AZER:STAT OFF')  # 2450: autozero
-                        # 2450 doesn't have :DISP:ENAB, skip it
+                        # Disable automatic measurements that slow down voltage changes
+                        self.keithley.instrument.write(':OUTP OFF')
+                        time.sleep(0.05)
+                        self.keithley.instrument.write(':SENS:FUNC "CURR"')
+                        self.keithley.instrument.write(':SENS:CURR:NPLC 0.01')
+                        self.keithley.instrument.write(':SENS:CURR:RANG:AUTO OFF')  # Disable current auto-range
+                        self.keithley.instrument.write(f':SENS:CURR:RANG {self.keithley.compliance_current}')  # Match sense range to compliance
+
+                        # Model-specific commands
+                        if self.keithley.model == '2450':
+                            self.keithley.instrument.write(':SOUR:DEL 0')  # 2450: source delay
+                            self.keithley.instrument.write(':SYST:AZER:STAT OFF')  # 2450: autozero
+                            # 2450 doesn't have :DISP:ENAB, skip it
+                        else:
+                            self.keithley.instrument.write(':SOUR:DEL 0')  # 2400: source delay
+                            self.keithley.instrument.write(':SYST:AZER:STAT OFF')  # 2400: autozero
+                            self.keithley.instrument.write(':DISP:ENAB OFF')  # 2400: display
+
+                        # Ensure output is on
+                        self.keithley.instrument.write(':OUTP ON')
                     else:
-                        self.keithley.instrument.write(':SOUR:DEL 0')  # 2400: source delay
-                        self.keithley.instrument.write(':SYST:AZER:STAT OFF')  # 2400: autozero
-                        self.keithley.instrument.write(':DISP:ENAB OFF')  # 2400: display
-
-                    # Ensure output is on
-                    self.keithley.instrument.write(':OUTP ON')
+                        # BK: just make sure output is on. Channel was selected
+                        # at connect time and remains selected (CH<n>).
+                        self.keithley.instrument.write(self.keithley.commands['output_on'])
                     time.sleep(0.1)
 
                     # Initialize accumulator arrays for averaging
@@ -789,11 +1224,12 @@ class MeasurementEngine:
                         self.keithley.ramp_to_voltage(sweep_start, slew_rate=self.gate_slew_rate)
                         time.sleep(0.05)
 
-                        # Flush VNA buffer before each sweep
+                        # Flush VNA buffer before each sweep pass.
+                        # In continuous mode the VNA is already measuring;
+                        # just wait for a fresh reading and discard it.
                         if self.vna.connected:
-                            self.vna.write(":INIT:IMM")
-                            time.sleep(0.03)
-                            _ = self.vna.get_cw_data()  # Discard stale data
+                            self.vna.trigger_sweep()  # waits one measurement cycle
+                            _ = self.vna.get_cw_data()  # discard stale data
 
                         t_start = time_module.perf_counter()
 
@@ -1051,13 +1487,13 @@ class MeasurementEngine:
                             if hasattr(self.magnet, 'query'):
                                 response = self.magnet.query("RATE? 0")
                                 if response:
+                                    # RATE? returns A/s regardless of display units
                                     reported_A_s = float(response.strip())
-                                    actual_hardware_rate = reported_A_s * self.magnet.field_per_amp * 60.0  # Convert to T/min
+                                    actual_hardware_rate = reported_A_s * self.magnet.field_per_amp * 60.0  # A/s -> T/min
 
-                                    # Check if hardware rate differs from requested (use percentage for robustness)
+                                    # Check if hardware rate differs from requested
                                     requested_A_s = actual_ramp_rate / 60.0 / self.magnet.field_per_amp
-                                    rate_difference = abs(reported_A_s - requested_A_s)
-                                    rate_error_percent = (rate_difference / max(requested_A_s, 1e-6)) * 100
+                                    rate_error_percent = abs(reported_A_s - requested_A_s) / max(requested_A_s, 1e-6) * 100
 
                                     # If hardware rate is different by more than 5%, warn and recalculate timing
                                     if rate_error_percent > 5.0:
@@ -1080,14 +1516,14 @@ class MeasurementEngine:
                             pass
 
                     # 3. Set the limit (don't start sweep yet)
-                    # NOTE: Semicolon required due to firmware bug in some versions
+                    # ULIM/LLIM always expect kilogauss regardless of display units
                     if hasattr(self.magnet, 'write'):
                         target_kG = field_stop * 10.0
                         if field_stop > current_field:
-                            self.magnet.write(f"ULIM {target_kG:.3f};")
+                            self.magnet.write(f"ULIM {target_kG:.4f}")
                             sweep_cmd = "SWEEP UP"
                         else:
-                            self.magnet.write(f"LLIM {target_kG:.3f};")
+                            self.magnet.write(f"LLIM {target_kG:.4f}")
                             sweep_cmd = "SWEEP DOWN"
                         time.sleep(0.2)
 
@@ -1205,7 +1641,9 @@ class MeasurementEngine:
                         # Calculate normalized value if field reference available
                         s21_mag_db = 20 * np.log10(np.abs(s21) + 1e-12)
                         s21_mag_db_norm = None
-                        if field_reference_s21_mag_db is not None:
+                        if field_per_step_reference and step_idx in field_step_reference_db:
+                            s21_mag_db_norm = s21_mag_db - field_step_reference_db[step_idx]
+                        elif field_reference_s21_mag_db is not None:
                             s21_mag_db_norm = s21_mag_db - field_reference_s21_mag_db
 
                         # Store with display_field for now; real field filled in post-loop
@@ -1385,8 +1823,13 @@ class MeasurementEngine:
                     # Info message for B-field sweeps with averaging
                     if sweep_param == "B-Field (T)" and config.get('averages', 1) > 1:
                         num_averages = config.get('averages', 1)
-                        print(f"  B-field stepped sweep: {sweep_points} points \u00d7 {num_averages} averages")
+                        print(f"  B-field stepped sweep: {sweep_points} points × {num_averages} averages")
                         print(f"  Field stops at each point for {num_averages} measurements")
+
+                    # Set ramp rate once before the sweep loop (not per-point)
+                    if sweep_param == "B-Field (T)" and not self.use_simulation and self.magnet.connected:
+                        if hasattr(self.magnet, 'set_rate'):
+                            self.magnet.set_rate(self.field_ramp_rate)
 
                     for sweep_idx, sweep_val in enumerate(sweep_values):
                         if self.should_stop:
@@ -1397,7 +1840,36 @@ class MeasurementEngine:
                         self.progress_queue.put(progress)
 
                         # Set sweep parameter
-                        self._set_parameter(sweep_param, sweep_val, fixed_values)
+                        # For the first point, let the driver determine direction from
+                        # the actual field reading — the magnet may need to ramp the
+                        # opposite way to reach the start (e.g., after a reference
+                        # measurement at a different field).
+                        first_point_dir = None if sweep_idx == 0 else field_sweep_direction
+                        self._set_parameter(sweep_param, sweep_val, fixed_values,
+                                            field_direction=first_point_dir)
+
+                        # Interleaved frequency reference measurement
+                        # (measure at ref freq first, then switch back to main freq)
+                        freq_ref_s21_mag_db = None
+                        if freq_normalization_enabled and not self.use_simulation and self.vna.connected:
+                            # Switch to reference frequency
+                            self.vna.setup_cw_mode(
+                                freq_normalization_freq,
+                                fixed_values.get('ifbw', 100),
+                                fixed_values.get('power', -10)
+                            )
+                            time.sleep(0.05)  # Brief settle after freq change
+                            ref_s21 = self._get_real_data()
+                            freq_ref_s21_mag_db = 20 * np.log10(np.abs(ref_s21) + 1e-12)
+                            # Switch back to measurement frequency
+                            self.vna.setup_cw_mode(
+                                fixed_values.get('frequency', 8e9),
+                                fixed_values.get('ifbw', 100),
+                                fixed_values.get('power', -10)
+                            )
+                            time.sleep(0.05)  # Brief settle after freq change
+                            if sweep_idx == 0:
+                                print(f"  Freq ref at {freq_normalization_freq/1e9:.4g} GHz: {freq_ref_s21_mag_db:.2f} dB")
 
                         # Get measurement(s) with averaging
                         num_averages = config.get('averages', 1)
@@ -1436,11 +1908,13 @@ class MeasurementEngine:
                                     avg_mag_db = 20 * np.log10(np.abs(s21) + 1e-12)
                                     print(f"      Averaged result: {avg_mag_db:.3f} dB")
 
-                        # For B-field stepped sweeps, read the actual field after the magnet has reached target
-                        # This ensures we record the true field value, not just the commanded value
-                        # CRITICAL: Retry on stale reads - field accuracy is paramount
+                        # For B-field stepped sweeps with wait_for_field, the field was
+                        # verified within tolerance before measuring. Use the commanded
+                        # target value to guarantee monotonic x-axis (field readings have
+                        # ~0.1 mT jitter that causes non-monotonic points).
+                        # For non-wait sweeps, read actual field since it may differ.
                         actual_sweep_val = sweep_val
-                        if sweep_param == "B-Field (T)" and not self.use_simulation and self.magnet.connected:
+                        if sweep_param == "B-Field (T)" and not self.use_simulation and self.magnet.connected and not self.wait_for_field:
                             max_retries = 10
                             retry_delay = 0.5  # seconds
 
@@ -1466,7 +1940,15 @@ class MeasurementEngine:
                         # Calculate normalized value if reference available
                         s21_mag_db = 20 * np.log10(np.abs(s21) + 1e-12)
                         s21_mag_db_norm = None
-                        if reference_s21_mag_db is not None:
+                        if freq_ref_s21_mag_db is not None:
+                            # Interleaved frequency normalization (measured at same field point)
+                            s21_mag_db_norm = s21_mag_db - freq_ref_s21_mag_db
+                        elif field_per_step_reference and step_idx in field_step_reference_db:
+                            # Per-step field reference for B-field sweep + freq step
+                            s21_mag_db_norm = s21_mag_db - field_step_reference_db[step_idx]
+                        elif field_reference_s21_mag_db is not None:
+                            s21_mag_db_norm = s21_mag_db - field_reference_s21_mag_db
+                        elif reference_s21_mag_db is not None:
                             s21_mag_db_norm = s21_mag_db - reference_s21_mag_db
                         elif reference_spectrum_mag_db is not None and sweep_idx < len(reference_spectrum_mag_db):
                             s21_mag_db_norm = s21_mag_db - reference_spectrum_mag_db[sweep_idx]
@@ -1553,15 +2035,36 @@ class MeasurementEngine:
             })
 
             # Try to safe the gate on any error
-            if gate_involved:
+            if gate_involved or gate_normalization_fixed_mode:
                 print("Attempting to safe gate voltage after error...")
                 self.gate_safety.abort_measurement()
 
         finally:
+            # Post-sweep: Clean up VNA state (critical after abort!)
+            # If the measurement was interrupted mid-sweep or mid-data-read,
+            # the VNA's trigger system and TCP socket may be in a bad state.
+            # flush_and_reset drains stale socket data, aborts any running
+            # sweep, and restores continuous mode.
+            if not self.use_simulation and self.vna.connected:
+                try:
+                    self.vna.flush_and_reset()
+                except Exception as e:
+                    print(f"VNA cleanup error: {e}")
+
+            # Post-sweep: Pause magnet ramp but do NOT auto-zero
+            if field_involved:
+                try:
+                    if hasattr(self.magnet, 'pause'):
+                        self.magnet.pause()
+                        print("=== Magnet paused (field held at last value) ===")
+                except Exception as e:
+                    print(f"ERROR in post-sweep magnet handling: {e}")
+
             # Post-sweep: Handle gate voltage
-            if gate_involved:
+            if gate_involved or gate_normalization_fixed_mode:
                 self.gate_safety.end_measurement()
 
+            if gate_involved:
                 try:
                     if self.should_stop and self.gate_ramp_on_stop:
                         # User stopped - ramp to zero if enabled
@@ -1584,7 +2087,7 @@ class MeasurementEngine:
 
             self.is_running = False
 
-    def _set_parameter(self, param, value, fixed_values, sweep_config=None, is_step=False, averages=1):
+    def _set_parameter(self, param, value, fixed_values, sweep_config=None, is_step=False, averages=1, field_direction=None):
         """Set a parameter value (real or simulated).
 
         Args:
@@ -1595,6 +2098,8 @@ class MeasurementEngine:
                          Used to reconfigure VNA sweep when stepping power during freq sweep
             is_step: If True, this is a step parameter change (may need to wait for stabilization)
             averages: Number of hardware averages for VNA (default 1)
+            field_direction: Optional 'up'/'down' hint for B-field ramp direction.
+                Prevents direction reversals from noisy field readings.
         """
         if param == "Frequency (GHz)":
             if not self.use_simulation and self.vna.connected:
@@ -1605,12 +2110,8 @@ class MeasurementEngine:
                 self.vna.trigger_sweep()
         elif param == "B-Field (T)":
             if not self.use_simulation and self.magnet.connected:
-                # Set the ramp rate first (if the magnet supports it)
-                if hasattr(self.magnet, 'set_rate'):
-                    self.magnet.set_rate(self.field_ramp_rate)
-
                 print(f"Setting B-field to {value:.4f} T")
-                self.magnet.set_field(value)
+                self.magnet.set_field(value, direction=field_direction)
 
                 # Wait for field logic:
                 # - If this is a STEP parameter: wait only if wait_for_field checkbox is enabled
@@ -1631,6 +2132,9 @@ class MeasurementEngine:
                     while time.time() - start_time < timeout:
                         if self.should_stop:
                             print("Field wait interrupted by stop request")
+                            if hasattr(self.magnet, 'pause'):
+                                self.magnet.pause()
+                                print("Magnet ramp paused")
                             return
 
                         current_field = self.magnet.get_field()
@@ -1655,7 +2159,7 @@ class MeasurementEngine:
                             print(f"Field stabilized at {current_field:.4f} T")
                             break
 
-                        time.sleep(0.5)  # Check every 0.5s
+                        time.sleep(0.1)  # Brief pause between GPIB polls
                     else:
                         print(f"WARNING: Timeout waiting for field {value:.4f} T (current: {current_field:.4f} T)")
 

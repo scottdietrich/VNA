@@ -42,7 +42,10 @@ class CryomagneticsController:
             self.instrument = self.rm.open_resource(self.address)
             self.instrument.timeout = 10000  # 10 seconds base timeout (reduced during sweep queries)
             self.instrument.read_termination = '\r\n'
-            self.instrument.write_termination = '\r\n'
+            # CRITICAL: The 4G requires LF-only write termination.
+            # CRLF (\r\n) causes all write commands (ULIM, LLIM, RATE, SWEEP)
+            # to be silently rejected while queries still work.
+            self.instrument.write_termination = '\n'
 
             # Query identification
             idn = self.instrument.query("*IDN?")
@@ -144,7 +147,7 @@ class CryomagneticsController:
                 elif response.endswith('A'):
                     # Current in Amps - convert using coil constant
                     current = float(response.replace('A', '').strip())
-                    self.current_field = current * 0.1  # Example: 0.1 T/A
+                    self.current_field = current * self.field_per_amp
                 else:
                     # Try to parse as plain number (assume kG)
                     try:
@@ -192,29 +195,63 @@ class CryomagneticsController:
         """Get human-readable state string."""
         return "CONNECTED"
 
-    def set_field(self, target_field):
+    def set_field(self, target_field, direction=None):
+        """Set magnetic field to target value.
+
+        Args:
+            target_field: Target field in Tesla
+            direction: Optional hint - 'up' or 'down'. When provided, forces
+                ramp direction regardless of field reading. This prevents
+                direction reversals from noisy field readings during small
+                monotonic steps.
+        """
         if not self.connected:
             self.current_field = target_field
             return True
 
         try:
+            # ULIM/LLIM always expect kilogauss regardless of display units
             target_kG = target_field * 10.0
-            current_field = self.get_field()
 
-            if abs(target_field - current_field) < 0.001:
-                print(f"Cryomagnetics: Already at {target_field:.4f} T")
-                return True
-
-            # CRITICAL: Use atomic compound command with semicolon
-            # This prevents race condition where magnet ignores new limit
-            if target_field > current_field:
-                # Set upper limit and sweep up atomically
-                self.write(f"ULIM {target_kG:.3f}; SWEEP UP")
-                print(f"Cryomagnetics: Ramping UP to {target_field:.4f} T")
+            # Determine ramp direction: use hint if provided, else read field
+            if direction == 'up':
+                ramp_up = True
+            elif direction == 'down':
+                ramp_up = False
             else:
-                # Set lower limit and sweep down atomically
-                self.write(f"LLIM {target_kG:.3f}; SWEEP DOWN")
-                print(f"Cryomagnetics: Ramping DOWN to {target_field:.4f} T")
+                current_field = self.get_field()
+                if abs(target_field - current_field) < self.min_field_step_practical:
+                    print(f"Cryomagnetics: Already at {target_field:.4f} T")
+                    return True
+                ramp_up = target_field > current_field
+
+            # Only pause when direction changes — avoids transients
+            # during monotonic step sequences
+            last_dir = getattr(self, '_last_ramp_dir', None)
+            new_dir = 'up' if ramp_up else 'down'
+
+            if last_dir is not None and last_dir != new_dir:
+                # Direction reversal: must pause first (4G ignores new
+                # sweep direction while actively ramping the other way)
+                self.write("SWEEP PAUSE")
+                time.sleep(0.15)
+            elif last_dir is None:
+                # First ramp: pause for clean start
+                self.write("SWEEP PAUSE")
+                time.sleep(0.15)
+
+            self._last_ramp_dir = new_dir
+
+            # Set limit and issue sweep
+            # No sleep needed between GPIB commands — bus is synchronous
+            if ramp_up:
+                self.write(f"ULIM {target_kG:.4f}")
+                self.write("SWEEP UP")
+                print(f"Cryomagnetics: Ramping UP to {target_field:.4f} T (ULIM={target_kG:.4f} kG)")
+            else:
+                self.write(f"LLIM {target_kG:.4f}")
+                self.write("SWEEP DOWN")
+                print(f"Cryomagnetics: Ramping DOWN to {target_field:.4f} T (LLIM={target_kG:.4f} kG)")
 
             return True
 
@@ -225,6 +262,10 @@ class CryomagneticsController:
     def pause(self):
         """Pause ramping."""
         return self.write("SWEEP PAUSE")
+
+    def stop_ramp(self):
+        """Stop ramping (alias for pause)."""
+        return self.pause()
 
     def ramp(self):
         """Resume ramping."""
@@ -247,19 +288,19 @@ class CryomagneticsController:
         else:
             rate_T_s = rate
 
-        # Convert T/s to A/s using coil constant
+        # RATE command always expects A/s regardless of display units
         rate_A_s = rate_T_s / self.field_per_amp
 
-        # Clamp to safe range
+        # Clamp to safe range (A/s)
         rate_A_s = max(0.001, min(1.0, rate_A_s))
 
-        # Use RATE 0 format (range 0) with semicolon (firmware bug workaround)
-        self.write(f"RATE 0 {rate_A_s:.4f};")
+        # Set rate for range 0
+        self.write(f"RATE 0 {rate_A_s:.4f}")
         time.sleep(0.2)
 
         print(f"Cryomagnetics: Set ramp rate to {rate:.3f} T/min ({rate_A_s:.4f} A/s)")
 
-        # Verify with RATE? 0 (include range number in query)
+        # Verify
         time.sleep(0.1)
         try:
             response = self.query("RATE? 0")
@@ -268,11 +309,9 @@ class CryomagneticsController:
                 reported_T_min = reported_rate * self.field_per_amp * 60.0
                 print(f"  Confirmed rate: {reported_rate:.4f} A/s ({reported_T_min:.3f} T/min)")
 
-                # If rate is not close to what we requested, warn user
                 if abs(reported_rate - rate_A_s) > 0.001:
                     print(f"  WARNING: Controller reported different rate!")
                     print(f"           Requested {rate_A_s:.4f} A/s, got {reported_rate:.4f} A/s")
-                    print(f"           This should not happen with semicolon workaround")
         except Exception as e:
             print(f"  Could not verify rate: {e}")
 

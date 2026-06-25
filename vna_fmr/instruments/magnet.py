@@ -160,11 +160,12 @@ class MagnetController:
         }
         return states.get(self.get_state(), "UNKNOWN")
 
-    def set_field(self, target_field):
+    def set_field(self, target_field, direction=None):
         """Set target magnetic field and initiate ramp.
 
         Args:
             target_field: Target field in Tesla
+            direction: Optional 'up'/'down' hint (used by Cryomagnetics)
 
         Returns:
             True if command accepted

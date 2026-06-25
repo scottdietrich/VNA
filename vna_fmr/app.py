@@ -122,6 +122,10 @@ class VNAMeasurementApp:
         # Field normalization reference data
         self.field_reference_data = None  # Will hold reference S21 (single value or spectrum)
         self.reference_field = None  # The field at which reference was taken
+
+        # Frequency normalization reference data
+        self.freq_reference_data = None  # Will hold reference frequency value
+        self.reference_freq = None  # The frequency at which reference was taken
         
         # Temperature monitoring
         self.current_temperature_k = None  # Last read temperature from Lakeshore 370
@@ -138,8 +142,7 @@ class VNAMeasurementApp:
         # Load saved settings
         self.load_settings()
         
-        # Set up window close handler
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # Window close is handled by main() — see on_closing() below.
         
         # Start update loop
         self.update_gui()
@@ -194,7 +197,16 @@ class VNAMeasurementApp:
         # B-field normalization
         self.field_normalization_enabled = tk.BooleanVar(value=False)
         self.field_normalization_field = tk.StringVar(value="0")
-        
+
+        # Frequency normalization (for B-field sweeps)
+        self.freq_normalization_enabled = tk.BooleanVar(value=False)
+        self.freq_normalization_freq = tk.StringVar(value="0")
+
+        # EPR tracking mode
+        self.epr_tracking_enabled = tk.BooleanVar(value=False)
+        self.epr_g_factor = tk.StringVar(value="2.00")
+        self.epr_span = tk.StringVar(value="2.0")  # GHz or T depending on sweep param
+
         # Sample parameters (for density/filling factor)
         self.hbn_thickness = tk.StringVar(value="80")
         self.v_cnp = tk.StringVar(value="0")
@@ -314,7 +326,7 @@ class VNAMeasurementApp:
         ttk.Label(keithley_label_frame, text="Gate SMU:").pack(side='left')
         keithley_model_combo = ttk.Combobox(
             keithley_label_frame, textvariable=self.keithley_model,
-            values=["2400", "2450"], width=5, state='readonly'
+            values=["2400", "2450", "BK 9132B"], width=10, state='readonly'
         )
         keithley_model_combo.pack(side='left', padx=5)
         
@@ -323,7 +335,9 @@ class VNAMeasurementApp:
         ttk.Label(keithley_addr_frame, text="Addr:").pack(side='left')
         keithley_addr_entry = ttk.Entry(keithley_addr_frame, textvariable=self.keithley_addr, width=25)
         keithley_addr_entry.pack(side='left')
-        ToolTip(keithley_addr_entry, "GPIB: Enter number (e.g., 18)\nUSB: Enter full address (e.g., USB0::0x05E6::0x2450::04102170::INSTR)")
+        ToolTip(keithley_addr_entry, "GPIB: Enter number (e.g., 18)\n"
+                                     "USB: Enter full address (e.g., USB0::0x05E6::0x2450::04102170::INSTR)\n"
+                                     "BK 9132B: GPIB number (e.g., 14)")
         
         self.keithley_status = ttk.Label(conn_frame, text="o", foreground='gray', font=('Arial', 14))
         self.keithley_status.grid(row=3, column=2, padx=10, pady=5)
@@ -482,12 +496,24 @@ class VNAMeasurementApp:
         self.field_tolerance = tk.StringVar(value="0.001")
         tol_entry = ttk.Entry(bfield_frame, textvariable=self.field_tolerance, width=6)
         tol_entry.grid(row=0, column=3, padx=2, pady=3, sticky='w')
-        ToolTip(tol_entry, "Field tolerance. 0.001 T = 10 Gauss")
+        ToolTip(tol_entry, "Field tolerance for 'reached target' check.\n"
+               "0.001 T = 10 Gauss.\n\n"
+               "Must be smaller than your B-field step size,\n"
+               "otherwise individual steps can't be resolved.\n"
+               "Auto-clamped to half the step size if too large.")
         
         ttk.Label(bfield_frame, text="Settle (s):").grid(row=0, column=4, padx=5, pady=3, sticky='w')
         self.field_settle_time = tk.StringVar(value="2.0")
         settle_entry = ttk.Entry(bfield_frame, textvariable=self.field_settle_time, width=6)
         settle_entry.grid(row=0, column=5, padx=2, pady=3, sticky='w')
+
+        ttk.Label(bfield_frame, text="Initial (s):").grid(row=0, column=6, padx=5, pady=3, sticky='w')
+        self.field_initial_settle_time = tk.StringVar(value="10.0")
+        initial_settle_entry = ttk.Entry(bfield_frame, textvariable=self.field_initial_settle_time, width=6)
+        initial_settle_entry.grid(row=0, column=7, padx=2, pady=3, sticky='w')
+        ToolTip(initial_settle_entry, "Extra settle time (s) for the first field ramp.\n"
+                "Applied when ramping to the normalization reference field\n"
+                "and before the first measurement step.")
         
         # Row 1: Checkboxes and current field
         self.wait_for_field = tk.BooleanVar(value=True)
@@ -697,10 +723,89 @@ class VNAMeasurementApp:
             font=('Arial', 8), foreground='gray'
         )
         self.field_norm_info_label.pack(padx=5, pady=2, anchor='w')
-        
-        # Update normalization UI visibility based on sweep/step params
+
+        # Frequency Normalization settings (for B-field sweeps)
+        self.freq_norm_frame = ttk.LabelFrame(left_frame, text="Frequency Normalization")
+        # Will be shown/hidden by update_normalization_visibility()
+
+        freq_norm_row1 = ttk.Frame(self.freq_norm_frame)
+        freq_norm_row1.pack(fill='x', padx=5, pady=2)
+
+        self.freq_norm_checkbox = ttk.Checkbutton(
+            freq_norm_row1, text="Enable normalization to reference frequency",
+            variable=self.freq_normalization_enabled,
+            command=self.on_freq_normalization_changed
+        )
+        self.freq_norm_checkbox.pack(side='left')
+
+        freq_norm_row2 = ttk.Frame(self.freq_norm_frame)
+        freq_norm_row2.pack(fill='x', padx=5, pady=2)
+
+        ttk.Label(freq_norm_row2, text="Reference freq:").pack(side='left', padx=(20, 5))
+        self.freq_norm_entry = ttk.Entry(freq_norm_row2, textvariable=self.freq_normalization_freq, width=8)
+        self.freq_norm_entry.pack(side='left')
+        ttk.Label(freq_norm_row2, text="GHz").pack(side='left', padx=2)
+
+        self.freq_norm_info_label = ttk.Label(
+            self.freq_norm_frame,
+            text="At each field point, measures S21 at ref frequency and subtracts",
+            font=('Arial', 8), foreground='gray'
+        )
+        self.freq_norm_info_label.pack(padx=5, pady=2, anchor='w')
+
+        # === EPR Tracking settings ===
+        self.epr_tracking_frame = ttk.LabelFrame(left_frame, text="EPR Tracking")
+        # Will be shown/hidden by update_epr_tracking_visibility()
+
+        epr_row1 = ttk.Frame(self.epr_tracking_frame)
+        epr_row1.pack(fill='x', padx=5, pady=2)
+
+        self.epr_checkbox = ttk.Checkbutton(
+            epr_row1, text="Enable EPR resonance tracking",
+            variable=self.epr_tracking_enabled,
+            command=self.on_epr_tracking_changed
+        )
+        self.epr_checkbox.pack(side='left')
+
+        epr_row2 = ttk.Frame(self.epr_tracking_frame)
+        epr_row2.pack(fill='x', padx=5, pady=2)
+
+        ttk.Label(epr_row2, text="g-factor:").pack(side='left', padx=(20, 5))
+        self.epr_g_entry = ttk.Entry(epr_row2, textvariable=self.epr_g_factor, width=8)
+        self.epr_g_entry.pack(side='left')
+        self.epr_gyro_label = ttk.Label(epr_row2, text="", font=('Arial', 8), foreground='gray')
+        self.epr_gyro_label.pack(side='left', padx=(10, 0))
+
+        epr_row3 = ttk.Frame(self.epr_tracking_frame)
+        epr_row3.pack(fill='x', padx=5, pady=2)
+
+        ttk.Label(epr_row3, text="Span:").pack(side='left', padx=(20, 5))
+        self.epr_span_entry = ttk.Entry(epr_row3, textvariable=self.epr_span, width=8)
+        self.epr_span_entry.pack(side='left')
+        self.epr_span_unit_label = ttk.Label(epr_row3, text="GHz")
+        self.epr_span_unit_label.pack(side='left', padx=2)
+
+        self.epr_info_label = ttk.Label(
+            self.epr_tracking_frame,
+            text="",
+            font=('Arial', 8), foreground='blue'
+        )
+        self.epr_info_label.pack(padx=5, pady=2, anchor='w')
+
+        ToolTip(self.epr_g_entry, "Electron g-factor for EPR resonance.\n"
+                "g = 2.00 for free electron.\n"
+                "f_res = g x 13.996 GHz/T x B")
+        ToolTip(self.epr_span_entry, "Width of the sweep window centered\n"
+                "on the expected resonance.")
+
+        # Wire g-factor and span to update info label
+        self.epr_g_factor.trace_add('write', self._update_epr_info)
+        self.epr_span.trace_add('write', self._update_epr_info)
+
+        # Update normalization and tracking UI visibility based on sweep/step params
         self.update_normalization_visibility()
-        
+        self.update_epr_tracking_visibility()
+
         # Control buttons (below sweep settings)
         control_frame = ttk.LabelFrame(left_frame, text="Measurement Control")
         control_frame.pack(fill='x', pady=5)
@@ -1102,6 +1207,69 @@ class VNAMeasurementApp:
         self.norm_status_label = ttk.Label(scale_frame, text="", foreground='orange', font=('Arial', 8))
         self.norm_status_label.pack(side='left', padx=5)
         
+        # SVD background removal controls (new row)
+        bg_frame = ttk.Frame(map_frame)
+        bg_frame.pack(fill='x', padx=5, pady=2)
+        
+        self.step_bg_removal = tk.BooleanVar(value=False)
+        bg_cb = ttk.Checkbutton(bg_frame, text="SVD background removal",
+                                variable=self.step_bg_removal,
+                                command=self._on_bg_removal_changed)
+        bg_cb.pack(side='left', padx=2)
+        ToolTip(bg_cb, "Remove standing-wave background from 2D maps using SVD.\n\n"
+                       "Decomposes the 2D map into orthogonal modes via Singular\n"
+                       "Value Decomposition. Standing waves are the dominant modes\n"
+                       "(constant or slowly varying across the step axis).\n"
+                       "Removing them leaves only features that change with the\n"
+                       "step parameter — like spin resonance signals.\n\n"
+                       "Modes: number of dominant modes to remove.\n"
+                       "  1-2: gentle (removes main standing wave pattern)\n"
+                       "  3-4: typical (removes >99% of standing wave variance)\n"
+                       "  5+:  aggressive (may start removing weak signals)")
+        
+        ttk.Label(bg_frame, text="Modes:").pack(side='left', padx=(5, 2))
+        self.step_bg_window = tk.IntVar(value=3)
+        bg_spinbox = ttk.Spinbox(
+            bg_frame, from_=1, to=15, increment=1,
+            textvariable=self.step_bg_window, width=4,
+            command=self._on_bg_removal_changed
+        )
+        bg_spinbox.pack(side='left', padx=2)
+        bg_spinbox.bind('<Return>', lambda e: self._on_bg_removal_changed())
+        
+        self.bg_info_label = ttk.Label(bg_frame, text="", font=('Arial', 8), foreground='gray')
+        self.bg_info_label.pack(side='left', padx=5)
+        
+        # Reference map subtraction controls (new row)
+        refmap_frame = ttk.Frame(map_frame)
+        refmap_frame.pack(fill='x', padx=5, pady=2)
+        
+        self.use_ref_map = tk.BooleanVar(value=False)
+        refmap_cb = ttk.Checkbutton(refmap_frame, text="Subtract ref map",
+                                     variable=self.use_ref_map,
+                                     command=lambda: self.update_2d_plot(force_rebuild=True))
+        refmap_cb.pack(side='left', padx=2)
+        ToolTip(refmap_cb, "Subtract a full 2D reference map point-by-point.\n\n"
+                           "Record a frequency-vs-gate map at a B-field where\n"
+                           "there is NO spin resonance (e.g., B=0). Then load\n"
+                           "it here. The standing waves are identical in both\n"
+                           "maps (cables don't care about B-field), so the\n"
+                           "subtraction cancels them perfectly at every (f, Vg)\n"
+                           "point. What remains is purely the B-field-dependent\n"
+                           "spin signal.")
+        
+        ttk.Button(refmap_frame, text="Load...", command=self._load_reference_map).pack(side='left', padx=2)
+        ttk.Button(refmap_frame, text="Clear", command=self._clear_reference_map).pack(side='left', padx=2)
+        
+        self.refmap_label = ttk.Label(refmap_frame, text="No reference map loaded",
+                                      font=('Arial', 8), foreground='gray')
+        self.refmap_label.pack(side='left', padx=5)
+        
+        # Storage for the loaded reference map
+        self._ref_map_z = None       # 2D numpy array (n_steps, n_sweep)
+        self._ref_map_steps = None   # step values (gate voltages, fields, etc.)
+        self._ref_map_sweep = None   # sweep values (frequencies, etc.)
+        
         ttk.Label(scale_frame, text="Min:").pack(side='left', padx=(5, 2))
         self.color_min = tk.StringVar(value="-60")
         self.color_min_entry = ttk.Entry(scale_frame, textvariable=self.color_min, width=6)
@@ -1377,6 +1545,11 @@ class VNAMeasurementApp:
         save_xlim = self.ax_trace.get_xlim() if hasattr(self, '_trace_has_data') and self._trace_has_data else None
         save_ylim = self.ax_trace.get_ylim() if hasattr(self, '_trace_has_data') and self._trace_has_data else None
         
+        # Remove any previous SVD twin axis before clearing
+        if hasattr(self, '_svd_twin_ax') and self._svd_twin_ax is not None:
+            self._svd_twin_ax.remove()
+            self._svd_twin_ax = None
+        
         self.ax_trace.clear()
         
         if not self.sweep_data_2d:
@@ -1395,10 +1568,14 @@ class VNAMeasurementApp:
         step_param = self.current_config.get('step_param') if self.current_config else None
         mode = self.trace_display_mode.get()
         xaxis_mode = self.xaxis_mode.get()
+
+        display_traces = self.sweep_data_2d
         
         # Determine y-axis label based on mode
         if mode == "Magnitude":
             ylabel = "|S21| (dB)"
+        elif mode == "Normalized":
+            ylabel = self._get_normalized_ylabel()
         elif mode == "Phase":
             ylabel = "Phase (deg)"
         elif mode == "Real":
@@ -1416,10 +1593,10 @@ class VNAMeasurementApp:
         
         if self.show_all_traces.get():
             # Show all traces with color gradient
-            n_traces = len(self.sweep_data_2d)
+            n_traces = len(display_traces)
             colors = cm.viridis(np.linspace(0, 1, max(n_traces, 1)))
             
-            for trace_idx, trace_data in enumerate(self.sweep_data_2d):
+            for trace_idx, trace_data in enumerate(display_traces):
                 if not trace_data:
                     continue
                 
@@ -1434,10 +1611,37 @@ class VNAMeasurementApp:
                                   alpha=alpha, linewidth=lw)
             
             self.ax_trace.set_title(f"All Traces ({n_traces} total, current highlighted)")
+            
+            # SVD overlay of current trace on right y-axis
+            if self.step_bg_removal.get() and n_traces >= 3:
+                try:
+                    valid_traces = [t for t in display_traces if t]
+                    z_matrix = np.array([
+                        self._get_trace_y_data(t, mode) for t in valid_traces
+                    ])
+                    dense_idx = sum(1 for i, t in enumerate(display_traces)
+                                    if t and i < self.current_step_index)
+                    n_remove = min(self.step_bg_window.get(), z_matrix.shape[0] - 1)
+                    if dense_idx < z_matrix.shape[0] and n_remove >= 1:
+                        U, S, Vt = np.linalg.svd(z_matrix, full_matrices=False)
+                        S[:n_remove] = 0
+                        z_clean = U @ np.diag(S) @ Vt
+                        svd_row = z_clean[dense_idx]
+                        current_trace = display_traces[self.current_step_index]
+                        if current_trace:
+                            svd_x = [x_convert(d['sweep_value']) for d in current_trace]
+                            ax2 = self.ax_trace.twinx()
+                            ax2.plot(svd_x, svd_row, 'r-', linewidth=0.9, alpha=0.85)
+                            ax2.set_ylabel(f"Δ{ylabel} (SVD-{n_remove})", color='r', fontsize=8)
+                            ax2.tick_params(axis='y', labelcolor='r', labelsize=7)
+                            ax2.autoscale(axis='y')
+                            self._svd_twin_ax = ax2
+                except Exception as e:
+                    print(f"SVD all-traces error: {e}")
         else:
             # Show only selected trace
-            if self.current_step_index < len(self.sweep_data_2d):
-                trace_data = self.sweep_data_2d[self.current_step_index]
+            if self.current_step_index < len(display_traces):
+                trace_data = display_traces[self.current_step_index]
                 
                 if trace_data:
                     sweep_vals = [x_convert(d['sweep_value']) for d in trace_data]
@@ -1468,6 +1672,32 @@ class VNAMeasurementApp:
                     else:
                         # Normal display (single sweep or first sweep of averaging)
                         self.ax_trace.plot(sweep_vals, y, 'b-', linewidth=0.5)
+                        
+                        # SVD overlay on secondary y-axis (right side)
+                        if self.step_bg_removal.get() and len(self.sweep_data_2d) >= 3:
+                            try:
+                                valid_traces = [t for t in self.sweep_data_2d if t]
+                                z_matrix = np.array([
+                                    self._get_trace_y_data(t, mode) for t in valid_traces
+                                ])
+                                dense_idx = sum(1 for i, t in enumerate(self.sweep_data_2d)
+                                                if t and i < self.current_step_index)
+                                n_remove = min(self.step_bg_window.get(), z_matrix.shape[0] - 1)
+                                if dense_idx < z_matrix.shape[0] and n_remove >= 1:
+                                    U, S, Vt = np.linalg.svd(z_matrix, full_matrices=False)
+                                    S[:n_remove] = 0
+                                    z_clean = U @ np.diag(S) @ Vt
+                                    svd_row = z_clean[dense_idx]
+                                    
+                                    ax2 = self.ax_trace.twinx()
+                                    ax2.plot(sweep_vals, svd_row, 'r-', linewidth=0.7, alpha=0.85)
+                                    ax2.set_ylabel(f"Δ{ylabel} (SVD-{n_remove})", color='r', fontsize=8)
+                                    ax2.tick_params(axis='y', labelcolor='r', labelsize=7)
+                                    ax2.autoscale(axis='y')
+                                    # Store ref so matplotlib doesn't garbage-collect it
+                                    self._svd_twin_ax = ax2
+                            except Exception as e:
+                                print(f"SVD single-trace error: {e}")
                     
                     # Build title with sweep details
                     title_parts = []
@@ -1559,6 +1789,11 @@ class VNAMeasurementApp:
         # Also update the secondary trace in 2D mode
         if self.current_plot_mode == "2D" and self.current_step_index < len(self.sweep_data_2d):
             self.ax_trace_2d.clear()
+            # Remove old SVD twin axis if it exists
+            if hasattr(self, '_svd_twin_ax_2d') and self._svd_twin_ax_2d is not None:
+                self._svd_twin_ax_2d.remove()
+                self._svd_twin_ax_2d = None
+            
             trace_data = self.sweep_data_2d[self.current_step_index]
             
             if trace_data:
@@ -1566,9 +1801,35 @@ class VNAMeasurementApp:
                 y = self._get_trace_y_data(trace_data, mode)
                 self.ax_trace_2d.plot(sweep_vals, y, 'b-', linewidth=0.8)
                 self.ax_trace_2d.set_xlabel(xlabel, fontsize=8)
-                self.ax_trace_2d.set_ylabel(ylabel, fontsize=8)
-                self.ax_trace_2d.tick_params(labelsize=7)
+                self.ax_trace_2d.set_ylabel(ylabel, fontsize=8, color='b')
+                self.ax_trace_2d.tick_params(axis='y', labelcolor='b', labelsize=7)
+                self.ax_trace_2d.tick_params(axis='x', labelsize=7)
                 self.ax_trace_2d.grid(True, alpha=0.3)
+                
+                # SVD red line on right y-axis
+                if self.step_bg_removal.get() and len(self.sweep_data_2d) >= 3:
+                    try:
+                        valid_traces = [t for t in self.sweep_data_2d if t]
+                        z_matrix = np.array([
+                            self._get_trace_y_data(t, mode) for t in valid_traces
+                        ])
+                        dense_idx = sum(1 for i, t in enumerate(self.sweep_data_2d)
+                                        if t and i < self.current_step_index)
+                        n_remove = min(self.step_bg_window.get(), z_matrix.shape[0] - 1)
+                        if dense_idx < z_matrix.shape[0] and n_remove >= 1:
+                            U, S, Vt = np.linalg.svd(z_matrix, full_matrices=False)
+                            S[:n_remove] = 0
+                            z_clean = U @ np.diag(S) @ Vt
+                            svd_row = z_clean[dense_idx]
+                            
+                            ax2 = self.ax_trace_2d.twinx()
+                            ax2.plot(sweep_vals, svd_row, 'r-', linewidth=0.7, alpha=0.85)
+                            ax2.set_ylabel(f"Δ (SVD-{n_remove})", color='r', fontsize=8)
+                            ax2.tick_params(axis='y', labelcolor='r', labelsize=7)
+                            ax2.autoscale(axis='y')
+                            self._svd_twin_ax_2d = ax2
+                    except Exception as e:
+                        print(f"SVD trace_2d error: {e}")
                 
                 # Custom tick formatting for filling factor
                 if xaxis_mode == "Filling Factor (nu)" and sweep_param == "Gate Voltage (V)":
@@ -1680,6 +1941,20 @@ class VNAMeasurementApp:
         # Default: use raw sweep value with display label conversion
         return lambda v: v * freq_scale, self._get_param_display_label(sweep_param)
     
+    def _get_normalized_ylabel(self):
+        """Build y-axis label for Normalized display mode, including reference info."""
+        label = "\u0394S21 (dB)"
+        ref_parts = []
+        if self.freq_reference_data and self.reference_freq:
+            ref_parts.append(f"ref f = {self.reference_freq/1e9:.4g} GHz")
+        if self.field_reference_data and self.reference_field is not None:
+            ref_parts.append(f"ref B = {self.reference_field:.4g} T")
+        if self.reference_data and self.reference_voltage is not None:
+            ref_parts.append(f"ref V = {self.reference_voltage:.4g} V")
+        if ref_parts:
+            label += ",  " + ", ".join(ref_parts)
+        return label
+
     def _get_trace_y_data(self, trace_data, mode, apply_normalization=True):
         """Extract y-axis data from trace based on display mode.
         
@@ -1971,6 +2246,7 @@ class VNAMeasurementApp:
             self.measurement_engine.magnet = self.magnet
             # Show B-field in fixed params
             self.update_bfield_visibility()
+            self.update_normalization_visibility()
         else:
             try:
                 self.magnet.set_address(self.magnet_addr.get())
@@ -1982,6 +2258,7 @@ class VNAMeasurementApp:
                     self.measurement_engine.magnet = self.magnet
                     # Show B-field in fixed params
                     self.update_bfield_visibility()
+                    self.update_normalization_visibility()
                     
                     # For SCM1, show reminder about LabVIEW mode
                     if model == "SCM1":
@@ -2019,17 +2296,22 @@ class VNAMeasurementApp:
             self.magnet_connected.set(False)
             self.magnet_status.config(foreground='gray')
             self.status_var.set(f"Switched to {model} - reconnect required")
+            self.update_normalization_visibility()
     
     def connect_keithley(self):
         """Connect to Keithley SMU."""
         # Set the model first
         self.keithley.set_model(self.keithley_model.get())
         
-        # Get compliance from GUI
-        try:
-            compliance = float(self.gate_compliance.get()) * 1e-9  # nA to A
-        except ValueError:
-            compliance = 100e-9
+        # Get compliance: BK 9132B uses its 3 A channel hardware limit;
+        # Keithley uses the GUI nA value.
+        if self.keithley.is_bk:
+            compliance = 3.0  # A — BK CH1/CH2 full hardware compliance
+        else:
+            try:
+                compliance = float(self.gate_compliance.get()) * 1e-9  # nA to A
+            except ValueError:
+                compliance = 100e-9
         self.keithley.compliance_current = compliance
         
         if self.simulation_mode.get():
@@ -2043,12 +2325,17 @@ class VNAMeasurementApp:
                     self.keithley_connected.set(True)
                     self.keithley_status.config(foreground='green')
                     self.status_var.set(f"Keithley {self.keithley_model.get()} connected")
-                    print(f"Compliance set to {compliance*1e9:.0f} nA")
+                    if compliance >= 1e-3:
+                        print(f"Compliance set to {compliance:.3f} A")
+                    else:
+                        print(f"Compliance set to {compliance*1e9:.0f} nA")
                     
                     # Force 2-wire mode and matching sense range (critical for speed!)
-                    self.keithley.instrument.write(':SYST:RSEN OFF')
-                    self.keithley.instrument.write(f':SENS:CURR:RANG {compliance}')
-                    print(f"2-wire mode enabled, sense range = {compliance*1e9:.0f} nA")
+                    # — Keithley 2400/2450 only; BK 9132B has neither setting.
+                    if not self.keithley.is_bk:
+                        self.keithley.instrument.write(':SYST:RSEN OFF')
+                        self.keithley.instrument.write(f':SENS:CURR:RANG {compliance}')
+                        print(f"2-wire mode enabled, sense range = {compliance*1e9:.0f} nA")
                     
                     # Clear any errors that accumulated during setup
                     try:
@@ -2062,7 +2349,7 @@ class VNAMeasurementApp:
                             print(f"  Cleared Keithley error: {err.strip()}")
                     except Exception as e:
                         print(f"  Error queue clear failed: {e}")
-                    print("Keithley ready")
+                    print(f"{self.keithley_model.get()} ready")
                 else:
                     messagebox.showerror("Connection Error", 
                         f"Failed to connect to Keithley {self.keithley_model.get()}\n\n"
@@ -2081,6 +2368,9 @@ class VNAMeasurementApp:
                         "For GPIB support, you also need a GPIB adapter driver.")
                 else:
                     messagebox.showerror("Connection Error", f"Keithley connection failed:\n{e}")
+
+        # Refresh normalization UI — gate norm should appear when SMU is connected
+        self.update_normalization_visibility()
     
     def connect_temp(self):
         """Connect to Lakeshore 370 temperature monitor - DISABLED."""
@@ -2259,15 +2549,23 @@ class VNAMeasurementApp:
     
     def update_field_display(self):
         """Update the current B-field display."""
+        # Skip GPIB polling while measurement is running to avoid
+        # bus contention — the measurement thread is already using this instrument
+        if self.measurement_engine.is_running:
+            return
         try:
             if self.magnet_connected.get():
                 field = self.magnet.get_field()
                 self.current_field_display.config(text=f"{field:.3f} T")
         except:
             pass
-    
+
     def update_gate_display(self):
         """Update the current gate voltage display."""
+        # Skip GPIB polling while measurement is running to avoid
+        # bus contention — the measurement thread is already using this instrument
+        if self.measurement_engine.is_running:
+            return
         try:
             voltage = self.keithley.get_voltage()
             self.current_gate_display.config(text=f"{voltage:.3f} V")
@@ -2421,6 +2719,7 @@ class VNAMeasurementApp:
         self.update_fixed_params_state()
         self.update_step_options()
         self.update_normalization_visibility()
+        self.update_epr_tracking_visibility()
         self.update_summary()
         self.update_scan_time_display()
     
@@ -2531,8 +2830,9 @@ class VNAMeasurementApp:
         
         self.update_fixed_params_state()
         self.update_normalization_visibility()
+        self.update_epr_tracking_visibility()
         self.update_summary()
-    
+
     def update_step_options(self):
         """Update step parameter options based on sweep selection."""
         sweep = self.sweep_param.get()
@@ -2557,65 +2857,75 @@ class VNAMeasurementApp:
                 self.fixed_entries['b_field'].grid_remove()
     
     def update_normalization_visibility(self):
-        """Show/hide gate and field normalization options based on sweep/step parameters.
-        
-        Gate normalization is available when:
-        - Gate voltage is the sweep parameter, OR
-        - Gate voltage is the step parameter
-        
-        Field normalization is available when:
-        - B-Field is the sweep parameter, OR
-        - B-Field is the step parameter
+        """Show/hide normalization frames based on sweep/step parameters.
+
+        Always unpacks ALL frames first, then repacks the applicable ones
+        in the original order (gate → field → freq) so Tkinter doesn't
+        shuffle them to the bottom of the parent container.
         """
         sweep = self.sweep_param.get()
         step = self.step_param.get()
-        
-        # Check if gate voltage is involved
+
         gate_is_sweep = (sweep == "Gate Voltage (V)")
         gate_is_step = (step == "Gate Voltage (V)")
-        
-        # Check if B-field is involved
         field_is_sweep = (sweep == "B-Field (T)")
         field_is_step = (step == "B-Field (T)")
-        
-        # Gate normalization visibility
-        if hasattr(self, 'gate_norm_frame'):
-            if gate_is_sweep or gate_is_step:
-                # Show gate normalization options
-                self.gate_norm_frame.pack(fill='x', pady=5)
-                
-                # Update info text based on mode
-                if gate_is_sweep:
-                    self.gate_norm_info_label.config(
-                        text="Will measure S21 at V_ref first, then subtract from each gate voltage point"
-                    )
-                else:  # gate_is_step
-                    self.gate_norm_info_label.config(
-                        text="Will take full spectrum at V_ref first, then subtract from each gate step spectrum"
-                    )
-            else:
-                # Hide gate normalization options
-                self.gate_norm_frame.pack_forget()
-        
-        # Field normalization visibility
-        if hasattr(self, 'field_norm_frame'):
-            if field_is_sweep or field_is_step:
-                # Show field normalization options
-                self.field_norm_frame.pack(fill='x', pady=5)
-                
-                # Update info text based on mode
-                if field_is_sweep:
-                    self.field_norm_info_label.config(
-                        text="Will measure S21 at B_ref first, then subtract from each field point"
-                    )
-                else:  # field_is_step
-                    self.field_norm_info_label.config(
-                        text="Will take full spectrum at B_ref first, then subtract from each field step spectrum"
-                    )
-            else:
-                # Hide field normalization options
-                self.field_norm_frame.pack_forget()
-    
+        freq_is_sweep = (sweep == "Frequency (GHz)")
+
+        # --- Determine which frames should be visible ---
+
+        # Gate norm: when gate is sweep/step, OR when doing a frequency
+        # sweep with an SMU connected (fixed-gate normalization).
+        show_gate = False
+        gate_info = ""
+        if gate_is_sweep:
+            show_gate = True
+            gate_info = "Will measure S21 at V_ref first, then subtract from each gate voltage point"
+        elif gate_is_step:
+            show_gate = True
+            gate_info = "Will take full spectrum at V_ref first, then subtract from each gate step spectrum"
+        elif freq_is_sweep and (self.keithley_connected.get() or self.simulation_mode.get()):
+            show_gate = True
+            gate_info = "Will ramp to V_ref, take reference spectrum, ramp back to fixed V_gate, then subtract"
+
+        # Field norm: when B-field is sweep/step, OR magnet connected
+        show_field = False
+        field_info = ""
+        field_is_fixed_with_magnet = (
+            not field_is_sweep and not field_is_step and
+            (self.magnet_connected.get() or self.simulation_mode.get())
+        )
+        if field_is_sweep:
+            show_field = True
+            field_info = "Will measure S21 at B_ref first, then subtract from each field point"
+        elif field_is_step:
+            show_field = True
+            field_info = "Will take full spectrum at B_ref first, then subtract from each field step spectrum"
+        elif field_is_fixed_with_magnet:
+            show_field = True
+            field_info = "Will ramp to B_ref, take reference spectrum, ramp back to fixed B, then subtract"
+
+        # Freq norm
+        show_freq = self.is_freq_normalization_applicable() if hasattr(self, 'freq_norm_frame') else False
+
+        # --- Unpack ALL frames first ---
+        for frame_name in ('gate_norm_frame', 'field_norm_frame', 'freq_norm_frame'):
+            frame = getattr(self, frame_name, None)
+            if frame:
+                frame.pack_forget()
+
+        # --- Repack in the correct order (gate → field → freq) ---
+        if show_gate and hasattr(self, 'gate_norm_frame'):
+            self.gate_norm_frame.pack(fill='x', pady=5)
+            self.gate_norm_info_label.config(text=gate_info)
+
+        if show_field and hasattr(self, 'field_norm_frame'):
+            self.field_norm_frame.pack(fill='x', pady=5)
+            self.field_norm_info_label.config(text=field_info)
+
+        if show_freq and hasattr(self, 'freq_norm_frame'):
+            self.freq_norm_frame.pack(fill='x', pady=5)
+
     def on_gate_normalization_changed(self):
         """Handle gate normalization checkbox change."""
         enabled = self.gate_normalization_enabled.get()
@@ -2627,18 +2937,137 @@ class VNAMeasurementApp:
         enabled = self.field_normalization_enabled.get()
         state = 'normal' if enabled else 'disabled'
         self.field_norm_entry.config(state=state)
-    
-    def is_gate_normalization_applicable(self):
-        """Check if gate normalization is applicable to current sweep/step configuration."""
+
+    def on_freq_normalization_changed(self):
+        """Handle frequency normalization checkbox change."""
+        enabled = self.freq_normalization_enabled.get()
+        state = 'normal' if enabled else 'disabled'
+        self.freq_norm_entry.config(state=state)
+
+    def is_freq_normalization_applicable(self):
+        """Check if frequency normalization is applicable.
+
+        Frequency normalization is available when B-Field is the sweep parameter
+        (i.e., doing a B-sweep at fixed frequency).
+        """
+        return self.sweep_param.get() == "B-Field (T)"
+
+    # --- EPR Tracking helpers ---
+
+    def on_epr_tracking_changed(self):
+        """Handle EPR tracking checkbox change."""
+        enabled = self.epr_tracking_enabled.get()
+        state = 'normal' if enabled else 'disabled'
+        self.epr_g_entry.config(state=state)
+        self.epr_span_entry.config(state=state)
+        self._update_epr_info()
+
+    def update_epr_tracking_visibility(self):
+        """Show/hide EPR tracking frame.
+
+        EPR tracking requires a 2D measurement with one axis being frequency
+        and the other being B-field.
+        """
+        if not hasattr(self, 'epr_tracking_frame'):
+            return
+
         sweep = self.sweep_param.get()
         step = self.step_param.get()
-        return (sweep == "Gate Voltage (V)") or (step == "Gate Voltage (V)")
+
+        is_applicable = (
+            (sweep == "Frequency (GHz)" and step == "B-Field (T)") or
+            (sweep == "B-Field (T)" and step == "Frequency (GHz)")
+        )
+
+        if is_applicable:
+            self.epr_tracking_frame.pack(fill='x', pady=5)
+            # Update span unit label
+            if sweep == "Frequency (GHz)":
+                self.epr_span_unit_label.config(text="GHz")
+            else:
+                self.epr_span_unit_label.config(text="T")
+            self._update_epr_info()
+        else:
+            self.epr_tracking_frame.pack_forget()
+            if self.epr_tracking_enabled.get():
+                self.epr_tracking_enabled.set(False)
+
+    def _update_epr_info(self, *args):
+        """Update EPR tracking info labels with computed resonance info."""
+        if not hasattr(self, 'epr_info_label'):
+            return
+        try:
+            g = float(self.epr_g_factor.get())
+            span = float(self.epr_span.get())
+            sweep = self.sweep_param.get()
+            step = self.step_param.get()
+
+            BOHR_GHZ_PER_T = 13.99624  # GHz/T
+            gamma = g * BOHR_GHZ_PER_T
+
+            # Update gyro label
+            self.epr_gyro_label.config(text=f"(\u03b3 = {gamma:.2f} GHz/T)")
+
+            if sweep == "Frequency (GHz)" and step == "B-Field (T)":
+                step_start = float(self.step_start.get())
+                step_stop = float(self.step_stop.get())
+                f_start = gamma * step_start
+                f_stop = gamma * step_stop
+                self.epr_info_label.config(
+                    text=f"f range: {f_start - span/2:.2f} \u2013 {f_stop + span/2:.2f} GHz"
+                )
+            elif sweep == "B-Field (T)" and step == "Frequency (GHz)":
+                step_start = float(self.step_start.get())  # Hz
+                step_stop = float(self.step_stop.get())     # Hz
+                b_start = (step_start / 1e9) / gamma
+                b_stop = (step_stop / 1e9) / gamma
+                b_lo = min(b_start, b_stop) - span / 2
+                b_hi = max(b_start, b_stop) + span / 2
+                self.epr_info_label.config(
+                    text=f"B range: {b_lo:.4f} \u2013 {b_hi:.4f} T"
+                )
+            else:
+                self.epr_info_label.config(text="")
+        except (ValueError, ZeroDivisionError):
+            self.epr_info_label.config(text="")
+            try:
+                g = float(self.epr_g_factor.get())
+                gamma = g * 13.99624
+                self.epr_gyro_label.config(text=f"(\u03b3 = {gamma:.2f} GHz/T)")
+            except ValueError:
+                self.epr_gyro_label.config(text="")
+
+    def is_gate_normalization_applicable(self):
+        """Check if gate normalization is applicable to current sweep/step configuration.
+
+        Gate normalization is available when:
+        - Gate voltage is the sweep or step parameter (original behavior), OR
+        - Keithley/BK is connected / simulation mode (gate is fixed, ramp to ref then back)
+        """
+        sweep = self.sweep_param.get()
+        step = self.step_param.get()
+        if (sweep == "Gate Voltage (V)") or (step == "Gate Voltage (V)"):
+            return True
+        # Also applicable when SMU is connected (ramp to ref, measure, ramp back)
+        if self.keithley_connected.get() or self.simulation_mode.get():
+            return True
+        return False
     
     def is_field_normalization_applicable(self):
-        """Check if field normalization is applicable to current sweep/step configuration."""
+        """Check if field normalization is applicable to current sweep/step configuration.
+
+        Field normalization is available when:
+        - B-Field is the sweep or step parameter (original behavior), OR
+        - Magnet is connected / simulation mode (B-field is fixed, ramp to ref then back)
+        """
         sweep = self.sweep_param.get()
         step = self.step_param.get()
-        return (sweep == "B-Field (T)") or (step == "B-Field (T)")
+        if (sweep == "B-Field (T)") or (step == "B-Field (T)"):
+            return True
+        # Also applicable when magnet is connected (ramp to ref, measure, ramp back)
+        if self.magnet_connected.get() or self.simulation_mode.get():
+            return True
+        return False
     
     def update_fixed_params_state(self):
         """Enable/disable fixed parameter entries based on sweep/step selection."""
@@ -2945,17 +3374,54 @@ class VNAMeasurementApp:
             fixed_gate = float(gate_str) if gate_str else 0.0  # Default 0 V
             
             # Clamp B-field points to respect hardware resolution
+            bfield_points_clamped = False
             if sweep_param == "B-Field (T)":
                 if self.clamp_bfield_points(self.sweep_start, self.sweep_stop, self.sweep_points, "sweep"):
                     clamped = True
+                    bfield_points_clamped = True
             if step_param == "B-Field (T)":
                 if self.clamp_bfield_points(self.step_start, self.step_stop, self.step_points, "step"):
                     clamped = True
+                    bfield_points_clamped = True
+
+            # Auto-clamp field tolerance if it's >= the B-field step size
+            bfield_tol_clamped = False
+            try:
+                field_tol = float(self.field_tolerance.get())
+                bfield_step = None
+                if step_param == "B-Field (T)":
+                    sp = int(self.step_points.get())
+                    if sp > 1:
+                        bfield_step = abs(step_stop - step_start) / (sp - 1)
+                elif sweep_param == "B-Field (T)":
+                    sp = int(self.sweep_points.get())
+                    if sp > 1:
+                        bfield_step = abs(sweep_stop - sweep_start) / (sp - 1)
+                if bfield_step is not None and field_tol >= bfield_step:
+                    new_tol = bfield_step / 2.0
+                    print(f"Field tolerance {field_tol:.4f} T >= step size {bfield_step:.4f} T, "
+                          f"clamping to {new_tol:.6f} T")
+                    self.field_tolerance.set(f"{new_tol:.6f}")
+                    clamped = True
+                    bfield_tol_clamped = True
+            except (ValueError, ZeroDivisionError):
+                pass
 
             # Force GUI update if values were clamped
             if clamped:
                 self.root.update_idletasks()
                 print("Values were clamped to valid ranges")
+
+            # Warn user about B-field clamping
+            if bfield_points_clamped or bfield_tol_clamped:
+                msgs = []
+                if bfield_points_clamped:
+                    msgs.append("B-field points were reduced to respect hardware resolution "
+                                f"(min step: {self.BFIELD_MIN_STEP*1000:.3f} mT).")
+                if bfield_tol_clamped:
+                    msgs.append(f"Field tolerance was reduced to {self.field_tolerance.get()} T "
+                                "so it can resolve individual steps.")
+                messagebox.showinfo("B-Field Settings Adjusted", "\n\n".join(msgs))
 
             config = {
                 'sweep_param': sweep_param,
@@ -2979,12 +3445,37 @@ class VNAMeasurementApp:
                 # Gate normalization settings
                 'gate_normalization_enabled': self.gate_normalization_enabled.get() and self.is_gate_normalization_applicable(),
                 'gate_normalization_voltage': float(self.gate_normalization_voltage.get()) if self.gate_normalization_enabled.get() else 0.0,
+                # Fixed-mode: gate norm enabled but gate is not sweep/step (ramp to ref, ramp back)
+                'gate_normalization_fixed_mode': (
+                    self.gate_normalization_enabled.get() and
+                    self.is_gate_normalization_applicable() and
+                    sweep_param != "Gate Voltage (V)" and
+                    (step_param is None or step_param != "Gate Voltage (V)")
+                ),
                 # Field normalization settings
                 'field_normalization_enabled': self.field_normalization_enabled.get() and self.is_field_normalization_applicable(),
                 'field_normalization_field': float(self.field_normalization_field.get()) if self.field_normalization_enabled.get() else 0.0,
+                # Fixed-mode: field norm enabled but B-field is not sweep/step (ramp to ref, ramp back)
+                'field_normalization_fixed_mode': (
+                    self.field_normalization_enabled.get() and
+                    self.is_field_normalization_applicable() and
+                    sweep_param != "B-Field (T)" and
+                    (step_param is None or step_param != "B-Field (T)")
+                ),
+                # Frequency normalization settings (for B-field sweeps)
+                'freq_normalization_enabled': self.freq_normalization_enabled.get() and self.is_freq_normalization_applicable(),
+                'freq_normalization_freq': float(self.freq_normalization_freq.get()) * 1e9 if self.freq_normalization_enabled.get() else 0.0,
                 # Legacy keys for backwards compatibility
                 'normalization_enabled': self.gate_normalization_enabled.get() and self.is_gate_normalization_applicable(),
-                'normalization_voltage': float(self.gate_normalization_voltage.get()) if self.gate_normalization_enabled.get() else 0.0
+                'normalization_voltage': float(self.gate_normalization_voltage.get()) if self.gate_normalization_enabled.get() else 0.0,
+                # EPR tracking settings
+                'epr_tracking_enabled': (
+                    self.epr_tracking_enabled.get() and
+                    hasattr(self, 'epr_tracking_frame') and
+                    self.epr_tracking_frame.winfo_ismapped()
+                ),
+                'epr_g_factor': float(self.epr_g_factor.get()) if self.epr_tracking_enabled.get() else 2.0,
+                'epr_span': float(self.epr_span.get()) if self.epr_tracking_enabled.get() else 0.0,
             }
         except ValueError as e:
             messagebox.showerror("Invalid Parameters", f"Please check parameter values: {e}")
@@ -3064,6 +3555,10 @@ class VNAMeasurementApp:
         # Clear field reference data for normalization
         self.field_reference_data = None
         self.reference_field = None
+
+        # Clear frequency reference data for normalization
+        self.freq_reference_data = None
+        self.reference_freq = None
         
         # Invalidate Z data cache
         self._z_cache = None
@@ -3118,6 +3613,12 @@ class VNAMeasurementApp:
             wait=self.wait_for_field.get()
         )
         
+        # Apply initial field settle time
+        try:
+            self.measurement_engine.field_initial_settle_time = float(self.field_initial_settle_time.get())
+        except ValueError:
+            self.measurement_engine.field_initial_settle_time = 10.0
+
         # Apply VNA settle time
         try:
             self.measurement_engine.vna_settle_time = float(self.vna_settle_time.get())
@@ -3144,6 +3645,21 @@ class VNAMeasurementApp:
     def stop_measurement(self):
         """Stop the measurement immediately."""
         self.measurement_engine.stop()
+        # Immediately abort any VNA sweep so it doesn't hang
+        if self.vna and self.vna.connected:
+            try:
+                self.vna.write(":ABOR")
+                print("VNA sweep aborted")
+            except Exception as e:
+                print(f"VNA abort error: {e}")
+        # Immediately pause the magnet so it doesn't keep ramping
+        # while the measurement thread winds down
+        if self.magnet and self.magnet.connected:
+            try:
+                self.magnet.pause()
+                print("Magnet ramp paused (stop requested)")
+            except Exception as e:
+                print(f"Warning: could not pause magnet: {e}")
         self.status_var.set("ABORTING - Please wait...")
         self.stop_button.config(state='disabled')
         # Force GUI update so user sees the abort message
@@ -3175,6 +3691,9 @@ class VNAMeasurementApp:
     
     def update_gui(self):
         """Periodic GUI update (called every 50ms)."""
+        if getattr(self, '_shutting_down', False):
+            return
+
         # Check for progress updates (process all available)
         try:
             while True:
@@ -3236,6 +3755,15 @@ class VNAMeasurementApp:
                 print(f"  Per-step references: {len(self.reference_data['per_step_db'])} frequencies")
             return
         
+        elif data['type'] == 'freq_reference_data':
+            # Store reference frequency for frequency normalization
+            self.reference_freq = data.get('frequency', 0.0)
+            self.freq_reference_data = {
+                'frequency': self.reference_freq
+            }
+            print(f"[GUI] Frequency reference data received for f={self.reference_freq/1e9:.4g} GHz")
+            return
+
         elif data['type'] == 'field_reference_data':
             # Store reference data for field normalization
             self.reference_field = data.get('field', 0.0)
@@ -3559,6 +4087,8 @@ class VNAMeasurementApp:
         
         Called via root.after() to keep GUI responsive during heavy plot updates.
         """
+        if getattr(self, '_shutting_down', False):
+            return
         try:
             self.status_var.set("Updating plots...")
             self.root.update_idletasks()
@@ -3631,7 +4161,9 @@ class VNAMeasurementApp:
             v_norm_val = float(self.v_norm.get()) if normalize_at_v else 0
         except:
             v_norm_val = 0
-        data_hash = (len(valid_traces), n_sweep, mode, smooth_window, normalize_at_v, v_norm_val)
+        data_hash = (len(valid_traces), n_sweep, mode, smooth_window, normalize_at_v, v_norm_val,
+                     self.step_bg_removal.get(), self.step_bg_window.get(),
+                     self.use_ref_map.get(), id(self._ref_map_z) if self._ref_map_z is not None else 0)
         
         # Check if we can use cached Z data
         use_cache = (
@@ -3647,28 +4179,25 @@ class VNAMeasurementApp:
             zlabel = self._z_label_cache
             cmap = self._z_cmap_cache
         else:
-            # Need to rebuild Z data
+            # Standard (non-gated) Z-building path
             if mode == "Magnitude":
                 z = np.array([[20 * np.log10(d['s21_mag'] + 1e-12) for d in trace] 
                              for trace in valid_traces])
                 zlabel = "|S21| (dB)"
                 cmap = 'viridis'
             elif mode == "Normalized":
-                # Use pre-measured reference normalization
-                # Check if normalized data is available
                 has_norm = (valid_traces and valid_traces[0] and 
                            's21_mag_db_norm' in valid_traces[0][0] and 
                            valid_traces[0][0]['s21_mag_db_norm'] is not None)
                 if has_norm:
-                    z = np.array([[d.get('s21_mag_db_norm', 0) for d in trace] 
+                    z = np.array([[d.get('s21_mag_db_norm', 0) for d in trace]
                                  for trace in valid_traces])
-                    zlabel = "Delta S21 (dB)"
+                    zlabel = self._get_normalized_ylabel()
                 else:
-                    # Fall back to raw magnitude
                     z = np.array([[20 * np.log10(d['s21_mag'] + 1e-12) for d in trace] 
                                  for trace in valid_traces])
                     zlabel = "|S21| (dB) [no ref]"
-                cmap = 'RdBu_r'  # Diverging colormap for difference
+                cmap = 'RdBu_r'
             elif mode == "Phase":
                 z = np.array([[d['s21_phase'] for d in trace] for trace in valid_traces])
                 zlabel = "Phase (deg)"
@@ -3728,6 +4257,74 @@ class VNAMeasurementApp:
                         except:
                             pass
 
+            # === REFERENCE MAP SUBTRACTION ===
+            # Subtract a previously recorded 2D map point-by-point.
+            # Standing waves depend on (f, Vg) but not on B-field, so a
+            # reference map at B=0 (no resonance) gives perfect cancellation.
+            if self.use_ref_map.get() and self._ref_map_z is not None:
+                ref_z = self._ref_map_z
+                if ref_z.shape == z.shape:
+                    # Perfect match — direct subtraction
+                    z = z - ref_z
+                    zlabel = "Δ" + zlabel + " (ref map)"
+                    cmap = 'RdBu_r'
+                elif ref_z.shape[1] == z.shape[1]:
+                    # Same frequency points but different number of steps —
+                    # interpolate along the step axis
+                    from scipy.interpolate import interp1d
+                    if self._ref_map_steps is not None and len(self._ref_map_steps) == ref_z.shape[0]:
+                        # Get current step values
+                        step_vals = np.array([t[0].get('step_value', 0) if isinstance(t[0], dict) else 0
+                                              for t in valid_traces if t])
+                        # If step_vals are all 0, fall back to linspace
+                        if np.all(step_vals == 0):
+                            step_vals = np.linspace(0, 1, z.shape[0])
+
+                        ref_interp = np.zeros_like(z)
+                        for j in range(z.shape[1]):
+                            f_interp = interp1d(self._ref_map_steps, ref_z[:, j],
+                                                kind='linear', fill_value='extrapolate')
+                            ref_interp[:, j] = f_interp(step_vals)
+                        z = z - ref_interp
+                    else:
+                        # Can't match steps — just truncate/pad
+                        n = min(ref_z.shape[0], z.shape[0])
+                        z[:n, :] = z[:n, :] - ref_z[:n, :]
+                    zlabel = "Δ" + zlabel + " (ref map)"
+                    cmap = 'RdBu_r'
+                else:
+                    print(f"WARNING: Reference map shape {ref_z.shape} doesn't match "
+                          f"data shape {z.shape} — skipping subtraction")
+
+            # === SVD BACKGROUND REMOVAL ===
+            # Decompose the 2D map into orthogonal modes. Standing waves
+            # dominate the first N singular values (they're the highest-
+            # variance patterns, roughly constant across the step axis).
+            # Zeroing them out leaves only features that CHANGE with the
+            # step parameter — i.e., the physics (spin resonances, etc.).
+            if self.step_bg_removal.get() and z.shape[0] >= 3:
+                n_remove = min(self.step_bg_window.get(), z.shape[0] - 1)
+                if n_remove >= 1:
+                    try:
+                        U, S, Vt = np.linalg.svd(z, full_matrices=False)
+                        # Compute variance explained by removed modes
+                        total_var = np.sum(S**2)
+                        removed_var = np.sum(S[:n_remove]**2)
+                        pct = 100 * removed_var / total_var if total_var > 0 else 0
+                        # Zero out the first n_remove singular values
+                        S_filtered = S.copy()
+                        S_filtered[:n_remove] = 0
+                        z = U @ np.diag(S_filtered) @ Vt
+                        zlabel = "Δ" + zlabel + f" (SVD -{n_remove})"
+                        # Update info label
+                        if hasattr(self, 'bg_info_label'):
+                            self.bg_info_label.config(
+                                text=f"Removed {pct:.1f}% of variance")
+                    except Exception as e:
+                        print(f"SVD background removal error: {e}")
+                        if hasattr(self, 'bg_info_label'):
+                            self.bg_info_label.config(text=f"Error: {e}")
+
             # Cache the Z data
             self._z_cache = z
             self._z_cache_key = data_hash
@@ -3753,9 +4350,25 @@ class VNAMeasurementApp:
         
         x_convert, xlabel_from_mode = self._get_xaxis_conversion(sweep_param, freq_scale, freq_unit, xaxis_mode)
         
+        # Check EPR tracking mode for relative axis display
+        epr_tracking_active = (
+            self.current_config and
+            self.current_config.get('epr_tracking_enabled', False)
+        )
+
         # Apply x-axis conversion to sweep values
         raw_sweep_vals = np.array([d['sweep_value'] for d in valid_traces[0]])
-        sweep_vals = np.array([x_convert(v) for v in raw_sweep_vals])
+        if epr_tracking_active:
+            # In tracking mode, use offset from resonance center (same span for all steps)
+            center_val = (raw_sweep_vals[0] + raw_sweep_vals[-1]) / 2.0
+            if sweep_param == "Frequency (GHz)":
+                # Convert Hz offset to GHz
+                sweep_vals = (raw_sweep_vals - center_val) / 1e9
+            else:
+                # B-field offset in T
+                sweep_vals = raw_sweep_vals - center_val
+        else:
+            sweep_vals = np.array([x_convert(v) for v in raw_sweep_vals])
         
         # Get step values, converting power to power at probe
         raw_step_vals = np.array([t[0]['step_value'] * step_freq_scale for t in valid_traces])
@@ -3821,7 +4434,15 @@ class VNAMeasurementApp:
         self.colorbar_data_range = (np.nanmin(z), np.nanmax(z))
         
         # Update axis labels - use x-axis mode for sweep axis
-        xlabel = xlabel_from_mode  # From _get_xaxis_conversion
+        if epr_tracking_active:
+            if sweep_param == "Frequency (GHz)":
+                xlabel = "\u0394f from resonance (GHz)"
+            elif sweep_param == "B-Field (T)":
+                xlabel = "\u0394B from resonance (T)"
+            else:
+                xlabel = xlabel_from_mode
+        else:
+            xlabel = xlabel_from_mode  # From _get_xaxis_conversion
             
         if step_param == "Frequency (GHz)" and step_freq_unit:
             ylabel = f"Frequency ({step_freq_unit})"
@@ -3937,7 +4558,92 @@ class VNAMeasurementApp:
         self.update_single_trace()
         if self.current_plot_mode == "2D":
             self.update_2d_plot()
-    
+
+    def _on_bg_removal_changed(self, *args):
+        """Handle SVD background removal checkbox or mode count change."""
+        if self.current_plot_mode == "2D":
+            self.update_2d_plot(force_rebuild=True)
+        self.update_single_trace()
+
+    def _load_reference_map(self):
+        """Load a previously saved 2D measurement as a reference map.
+
+        Expects a folder containing sweep_001.csv, sweep_002.csv, etc.
+        (the same format saved by auto-save after a 2D measurement).
+        Builds a 2D magnitude array and stores it for point-by-point
+        subtraction from the current measurement.
+        """
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(
+            title="Select reference map folder (containing sweep_NNN.csv files)",
+            initialdir=self.data_directory.get() if hasattr(self, 'data_directory') else "."
+        )
+        if not folder:
+            return
+
+        import os, glob
+        sweep_files = sorted(glob.glob(os.path.join(folder, "sweep_*.csv")))
+        if not sweep_files:
+            from tkinter import messagebox
+            messagebox.showerror("Error", "No sweep_NNN.csv files found in that folder.")
+            return
+
+        try:
+            ref_traces = []
+            ref_steps = []
+            for sf in sweep_files:
+                with open(sf) as f:
+                    lines = f.readlines()
+                # Extract step value from metadata
+                for line in lines:
+                    if '# Step Value:' in line:
+                        ref_steps.append(float(line.split(':')[1].strip()))
+                        break
+                # Parse data rows
+                data_lines = [l.strip() for l in lines if not l.startswith('#')]
+                header = data_lines[0].split(',')
+                mag_col = header.index('S21_Mag_dB') if 'S21_Mag_dB' in header else 3
+                row_data = []
+                for dl in data_lines[1:]:
+                    vals = dl.split(',')
+                    row_data.append(float(vals[mag_col]))
+                ref_traces.append(row_data)
+
+            self._ref_map_z = np.array(ref_traces)
+            self._ref_map_steps = np.array(ref_steps) if ref_steps else None
+
+            # Also read sweep (frequency) values from first file
+            with open(sweep_files[0]) as f:
+                lines = f.readlines()
+            data_lines = [l.strip() for l in lines if not l.startswith('#')]
+            header = data_lines[0].split(',')
+            freq_col = header.index('Frequency_GHz') if 'Frequency_GHz' in header else 0
+            self._ref_map_sweep = np.array([
+                float(dl.split(',')[freq_col]) for dl in data_lines[1:]
+            ])
+
+            n_steps, n_freq = self._ref_map_z.shape
+            self.refmap_label.config(
+                text=f"Loaded: {n_steps} steps × {n_freq} pts from {os.path.basename(folder)}",
+                foreground='green')
+            self.use_ref_map.set(True)
+            self.update_2d_plot(force_rebuild=True)
+            print(f"Reference map loaded: {n_steps} steps × {n_freq} freq points from {folder}")
+
+        except Exception as e:
+            from tkinter import messagebox
+            messagebox.showerror("Error", f"Failed to load reference map:\n{e}")
+            print(f"Reference map load error: {e}")
+
+    def _clear_reference_map(self):
+        """Clear the loaded reference map."""
+        self._ref_map_z = None
+        self._ref_map_steps = None
+        self._ref_map_sweep = None
+        self.use_ref_map.set(False)
+        self.refmap_label.config(text="No reference map loaded", foreground='gray')
+        self.update_2d_plot(force_rebuild=True)
+
     def _find_nearest_index(self, values, target):
         """Find index of value nearest to target.
         
@@ -4390,8 +5096,27 @@ class VNAMeasurementApp:
                             elif self.reference_data.get('spectrum_db') is not None:
                                 f.write(f"# Reference Spectrum Points: {len(self.reference_data['spectrum_db'])}\n")
                 
+                    # EPR tracking metadata
+                    if self.current_config.get('epr_tracking_enabled', False):
+                        g = self.current_config.get('epr_g_factor', 2.0)
+                        span = self.current_config.get('epr_span', 0.0)
+                        f.write(f"# EPR Tracking: Enabled\n")
+                        f.write(f"# EPR g-factor: {g}\n")
+                        f.write(f"# EPR Span: {span}\n")
+                        # Compute resonance center for this step
+                        if step_value is not None:
+                            BOHR_GHZ_PER_T = 13.99624
+                            gamma = g * BOHR_GHZ_PER_T
+                            step_param = self.current_config.get('step_param', '')
+                            if step_param == "B-Field (T)":
+                                f_center = gamma * step_value
+                                f.write(f"# EPR Resonance Center: {f_center:.4f} GHz\n")
+                            elif step_param == "Frequency (GHz)":
+                                b_center = (step_value / 1e9) / gamma
+                                f.write(f"# EPR Resonance Center: {b_center:.6f} T\n")
+
                 f.write("#\n")
-                
+
                 # Check if we have normalized data
                 has_normalized = sweep_data and 's21_mag_db_norm' in sweep_data[0] and sweep_data[0]['s21_mag_db_norm'] is not None
                 
@@ -4545,6 +5270,7 @@ class VNAMeasurementApp:
                     f.write(f"  Ramp Rate: {self.field_ramp_rate.get()} T/min\n")
                     f.write(f"  Tolerance: {self.field_tolerance.get()} T\n")
                     f.write(f"  Settle Time: {self.field_settle_time.get()} s\n")
+                    f.write(f"  Initial Settle Time: {self.field_initial_settle_time.get()} s\n")
                     f.write(f"  Wait for Field: {self.wait_for_field.get()}\n")
                 except:
                     pass
@@ -4882,6 +5608,7 @@ class VNAMeasurementApp:
             'field_ramp_rate': self.field_ramp_rate.get(),
             'field_tolerance': self.field_tolerance.get(),
             'field_settle_time': self.field_settle_time.get(),
+            'field_initial_settle_time': self.field_initial_settle_time.get(),
             'wait_for_field': self.wait_for_field.get(),
             'use_continuous_mode': self.use_continuous_mode.get() if hasattr(self, 'use_continuous_mode') else False,
             
@@ -4896,6 +5623,8 @@ class VNAMeasurementApp:
             'smoothing_window': self.smoothing_window.get(),
             'normalize_at_v': self.normalize_at_v.get(),
             'v_norm': self.v_norm.get(),
+            'step_bg_removal': self.step_bg_removal.get(),
+            'step_bg_window': self.step_bg_window.get(),
             
             # CNP normalization settings
             'gate_normalization_enabled': self.gate_normalization_enabled.get(),
@@ -4904,6 +5633,15 @@ class VNAMeasurementApp:
             # Field normalization settings
             'field_normalization_enabled': self.field_normalization_enabled.get(),
             'field_normalization_field': self.field_normalization_field.get(),
+
+            # Frequency normalization settings
+            'freq_normalization_enabled': self.freq_normalization_enabled.get(),
+            'freq_normalization_freq': self.freq_normalization_freq.get(),
+
+            # EPR tracking settings
+            'epr_tracking_enabled': self.epr_tracking_enabled.get(),
+            'epr_g_factor': self.epr_g_factor.get(),
+            'epr_span': self.epr_span.get(),
         }
         
         try:
@@ -4976,6 +5714,7 @@ class VNAMeasurementApp:
             if 'field_ramp_rate' in settings: self.field_ramp_rate.set(settings['field_ramp_rate'])
             if 'field_tolerance' in settings: self.field_tolerance.set(settings['field_tolerance'])
             if 'field_settle_time' in settings: self.field_settle_time.set(settings['field_settle_time'])
+            if 'field_initial_settle_time' in settings: self.field_initial_settle_time.set(settings['field_initial_settle_time'])
             if 'wait_for_field' in settings: self.wait_for_field.set(settings['wait_for_field'])
             # Backward compatibility: convert old force_stepped_mode to new use_continuous_mode
             if hasattr(self, 'use_continuous_mode'):
@@ -4996,6 +5735,8 @@ class VNAMeasurementApp:
             if 'smoothing_window' in settings: self.smoothing_window.set(settings['smoothing_window'])
             if 'normalize_at_v' in settings: self.normalize_at_v.set(settings['normalize_at_v'])
             if 'v_norm' in settings: self.v_norm.set(settings['v_norm'])
+            if 'step_bg_removal' in settings: self.step_bg_removal.set(settings['step_bg_removal'])
+            if 'step_bg_window' in settings: self.step_bg_window.set(settings['step_bg_window'])
             
             # CNP normalization settings
             if 'gate_normalization_enabled' in settings: self.gate_normalization_enabled.set(settings['gate_normalization_enabled'])
@@ -5004,12 +5745,22 @@ class VNAMeasurementApp:
             # Field normalization settings
             if 'field_normalization_enabled' in settings: self.field_normalization_enabled.set(settings['field_normalization_enabled'])
             if 'field_normalization_field' in settings: self.field_normalization_field.set(settings['field_normalization_field'])
-            
+
+            # Frequency normalization settings
+            if 'freq_normalization_enabled' in settings: self.freq_normalization_enabled.set(settings['freq_normalization_enabled'])
+            if 'freq_normalization_freq' in settings: self.freq_normalization_freq.set(settings['freq_normalization_freq'])
+
+            # EPR tracking settings
+            if 'epr_tracking_enabled' in settings: self.epr_tracking_enabled.set(settings['epr_tracking_enabled'])
+            if 'epr_g_factor' in settings: self.epr_g_factor.set(settings['epr_g_factor'])
+            if 'epr_span' in settings: self.epr_span.set(settings['epr_span'])
+
             # Update step parameter UI state
             self.on_step_param_changed()
-            
-            # Update normalization visibility
+
+            # Update normalization and tracking visibility
             self.update_normalization_visibility()
+            self.update_epr_tracking_visibility()
             
             # Update sample calculations
             self.update_sample_calculations()
@@ -5018,20 +5769,6 @@ class VNAMeasurementApp:
             
         except Exception as e:
             print(f"Warning: Could not load settings: {e}")
-    
-    def on_closing(self):
-        """Handle window close - save settings and cleanup."""
-        # Save settings
-        self.save_settings()
-        
-        # Stop log capture
-        log_manager.stop_capture()
-        
-        # Stop any running measurement
-        self.measurement_engine.stop_flag = True
-        
-        # Close the window
-        self.root.destroy()
 
 
 def main():
@@ -5054,100 +5791,114 @@ def main():
     app = VNAMeasurementApp(root)
     
     def on_closing():
-        # Try to get gate voltage safely
-        gate_voltage, reliable = app.keithley.get_voltage_safe()
-        
-        if not reliable:
-            # Communication problem - warn user
-            if messagebox.askyesno("Warning", 
-                "Cannot communicate with Keithley.\n\n"
-                "The gate voltage state is UNKNOWN.\n\n"
-                "Do you want to attempt emergency shutdown?"):
-                app.keithley.emergency_shutdown()
-            # Still disconnect other instruments
-            _cleanup_instruments()
-            root.destroy()
+        """Handle window close — hide immediately, cleanup, exit."""
+        # Re-entry guard: if we're already shutting down (user clicked X
+        # twice, or a dialog spawned another close event), do nothing.
+        if getattr(app, '_shutting_down', False):
             return
-        
-        if app.measurement_engine.is_running:
-            if messagebox.askokcancel("Quit", "Measurement in progress. Stop and quit?"):
+        app._shutting_down = True
+
+        # Hide the window NOW so it visually disappears instantly.
+        # All cleanup runs in the background; the user sees it as "closed".
+        root.withdraw()
+
+        try:
+            # --- Check for running measurement ---
+            if app.measurement_engine.is_running:
+                # Re-show briefly for the confirmation dialog
+                root.deiconify()
+                if not messagebox.askokcancel("Quit", "Measurement in progress. Stop and quit?"):
+                    app._shutting_down = False
+                    root.deiconify()
+                    return  # User cancelled — re-show window
+                root.withdraw()
                 app.measurement_engine.stop()
-                time.sleep(0.5)  # Give measurement time to stop
-                
-                # Ramp gate to zero if not already
-                if abs(gate_voltage) > 0.01:
-                    app.status_var.set("Ramping gate to zero before exit...")
-                    root.update()
+                time.sleep(0.5)  # Give measurement thread time to stop
+
+            # --- Gate voltage safety (only when SMU is actually connected) ---
+            if app.keithley and app.keithley.connected:
+                try:
+                    gate_voltage, reliable = app.keithley.get_voltage_safe()
+                except Exception:
+                    gate_voltage, reliable = 0.0, False
+
+                if not reliable:
+                    print("WARNING: Cannot read gate voltage — emergency shutdown")
+                    app.keithley.emergency_shutdown()
+                elif abs(gate_voltage) > 0.01:
+                    print(f"Ramping gate from {gate_voltage:.3f}V to zero...")
                     try:
                         app.keithley.ramp_to_voltage(0.0)
                     except Exception as e:
-                        print(f"Ramp failed: {e}")
-                        if messagebox.askyesno("Error", 
-                            f"Ramp to zero failed: {e}\n\nAttempt emergency shutdown?"):
-                            app.keithley.emergency_shutdown()
-                
-                _cleanup_instruments()
-                root.destroy()
-        else:
-            # Not running, but check gate voltage
-            if abs(gate_voltage) > 0.01:
-                if messagebox.askyesno("Gate Voltage", 
-                    f"Gate voltage is at {gate_voltage:.3f}V.\n\nRamp to zero before exiting?"):
-                    app.status_var.set("Ramping gate to zero...")
-                    root.update()
-                    try:
-                        app.keithley.ramp_to_voltage(0.0)
-                    except Exception as e:
-                        print(f"Ramp failed: {e}")
-                        if messagebox.askyesno("Error", 
-                            f"Ramp to zero failed: {e}\n\nAttempt emergency shutdown?"):
-                            app.keithley.emergency_shutdown()
-            _cleanup_instruments()
-            root.destroy()
-    
+                        print(f"Ramp to zero failed: {e} — emergency shutdown")
+                        app.keithley.emergency_shutdown()
+
+        except Exception as e:
+            print(f"Error during pre-shutdown gate handling: {e}")
+
+        # --- Disconnect all instruments ---
+        _cleanup_instruments()
+
+        # --- Kill the window and exit mainloop ---
+        try:
+            root.quit()     # break out of mainloop
+            root.destroy()  # destroy all widgets
+        except Exception:
+            pass  # window may already be gone
+
     def _cleanup_instruments():
-        """Properly disconnect all instruments before exit."""
+        """Disconnect all instruments safely before exit."""
         print("Cleaning up instrument connections...")
-        
-        # Save settings first
+
+        # Save settings (reads tk.StringVars — must happen before destroy)
         try:
             app.save_settings()
             print("Settings saved.")
         except Exception as e:
             print(f"Settings save error: {e}")
-        
-        # Disconnect magnet (important for SCM1 TCP connection!)
+
+        # Stop log capture
+        try:
+            log_manager.stop_capture()
+        except Exception:
+            pass
+
+        # VNA: turn off RF output, then disconnect socket
+        try:
+            if app.vna and app.vna.connected:
+                print("Disconnecting VNA...")
+                try:
+                    app.vna.write(":OUTP OFF")  # RF off — protect sample
+                except Exception:
+                    pass
+                app.vna.disconnect()
+        except Exception as e:
+            print(f"VNA disconnect error: {e}")
+
+        # Magnet: disconnect (important for SCM1 TCP connection)
         try:
             if app.magnet and app.magnet.connected:
                 print("Disconnecting magnet...")
                 app.magnet.disconnect()
         except Exception as e:
             print(f"Magnet disconnect error: {e}")
-        
-        # Disconnect VNA
-        try:
-            if app.vna and app.vna.connected:
-                print("Disconnecting VNA...")
-                app.vna.disconnect()
-        except Exception as e:
-            print(f"VNA disconnect error: {e}")
-        
-        # Disconnect Keithley
+
+        # Gate SMU (Keithley / BK): disconnect (ramps to zero internally)
         try:
             if app.keithley and app.keithley.connected:
-                print("Disconnecting Keithley...")
+                print(f"Disconnecting {app.keithley.model}...")
                 app.keithley.disconnect()
         except Exception as e:
-            print(f"Keithley disconnect error: {e}")
-        
-        # Disconnect temperature controller
+            print(f"SMU disconnect error: {e}")
+
+        # Temperature controller
         try:
             if app.temp_controller and app.temp_controller.connected:
                 print("Disconnecting temperature controller...")
                 app.temp_controller.disconnect()
         except Exception as e:
             print(f"Temperature controller disconnect error: {e}")
-        
+
         print("Cleanup complete.")
     
     root.protocol("WM_DELETE_WINDOW", on_closing)

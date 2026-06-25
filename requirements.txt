@@ -4,6 +4,7 @@
 numpy
 pandas
 matplotlib
+scipy
 pyvisa
 
 # Optional: pure-Python VISA backend (if NI-VISA is not installed)

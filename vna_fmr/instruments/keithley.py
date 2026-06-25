@@ -44,7 +44,27 @@ class KeithleyController:
             'output_state': ':OUTP?',
             'measure_current': ':MEAS:CURR?',
             'measure_voltage': ':MEAS:VOLT?',
-        }
+        },
+        # BK Precision 9132B Triple-Output Power Supply (GPIB).
+        # Channels are always voltage-source — there is no SOUR:FUNC mode
+        # to set, no remote-sense / NPLC / autozero / sense-range to
+        # configure. The active channel must be selected once via
+        # 'INST CHn' before any per-channel command. We default to CH1.
+        # Hardware limits: CH1/CH2 0–30 V, 3 A; CH3 0–5 V, 3 A.
+        'BK 9132B': {
+            'name': 'BK Precision 9132B',
+            'reset': '*RST',
+            'source_voltage': None,                  # N/A — always voltage source
+            'set_voltage': 'VOLT {:.6f}',            # acts on selected channel
+            'get_voltage': 'VOLT?',
+            'compliance_current': 'CURR {:.9f}',     # current limit on selected channel
+            'output_on': 'OUTP 1',
+            'output_off': 'OUTP 0',
+            'output_state': 'OUTP?',
+            'measure_current': 'MEAS:CURR?',
+            'measure_voltage': 'MEAS:VOLT?',
+            'select_channel': 'INST CH{}',           # BK-specific
+        },
     }
 
     def __init__(self, resource_manager=None, model='2450'):
@@ -60,6 +80,18 @@ class KeithleyController:
         self.model = model
         self.commands = self.MODELS.get(model, self.MODELS['2450'])
 
+        # BK 9132B is multi-channel — pick which channel drives the gate.
+        # CH1/CH2: 0–30 V, 3 A    CH3: 0–5 V, 3 A
+        # Ignored when self.model is a Keithley.
+        self.channel = 1
+
+        # BK-specific limits: CH1/CH2 can do 30 V / 3 A.
+        # The GUI's max_gate_voltage entry provides the user-facing soft cap.
+        if self.model == 'BK 9132B':
+            if self.max_voltage > 30.0:
+                self.max_voltage = 30.0
+            self.compliance_current = 3.0  # A — full channel hardware compliance
+
         # Safety settings
         self._safe_step_size = 1.0  # Maximum voltage step without ramping (V)
         self._emergency_stop = False
@@ -67,12 +99,22 @@ class KeithleyController:
         # For backward compatibility
         self.current_voltage = property(lambda self: self._current_voltage)
 
+    @property
+    def is_bk(self):
+        """True when this controller is driving a BK 9132B (vs a Keithley)."""
+        return self.model == 'BK 9132B'
+
     def set_model(self, model):
-        """Change the SMU model (2400 or 2450)."""
+        """Change the SMU model (2400, 2450, or BK 9132B)."""
         if model in self.MODELS:
             self.model = model
             self.commands = self.MODELS[model]
-            print(f"Keithley model set to {self.commands['name']}")
+            # When switching to BK, clamp max_voltage to CH1/CH2 hardware limit.
+            if self.is_bk:
+                if self.max_voltage > 30.0:
+                    self.max_voltage = 30.0
+                self.compliance_current = 3.0
+            print(f"SMU model set to {self.commands['name']}")
         else:
             print(f"Unknown model: {model}. Using 2450.")
             self.model = '2450'
@@ -230,9 +272,21 @@ class KeithleyController:
                 # Small delay to let connection stabilize
                 time.sleep(0.2)
 
+                # BK 9132B: must enter remote mode BEFORE any SCPI query.
+                # Without SYST:REM, the BK ignores queries and *IDN? times out.
+                if self.is_bk:
+                    self.instrument.write('SYST:REM')
+                    time.sleep(0.2)
+
                 # Verify connection
                 idn = self._query_raw('*IDN?')
                 print(f"Connected to: {idn}")
+
+                # BK 9132B: pick the active channel BEFORE any per-channel
+                # query (VOLT?, OUTP?, MEAS:*) so we read the correct one.
+                if self.is_bk:
+                    self._write_raw(self.commands['select_channel'].format(self.channel))
+                    time.sleep(0.05)
 
                 # ========== SAFETY CRITICAL SECTION ==========
                 # Read current state BEFORE doing anything else
@@ -260,17 +314,30 @@ class KeithleyController:
                 # ========== NOW safe to reset ==========
                 print("Resetting instrument...")
                 self._write_raw(self.commands['reset'])
-                time.sleep(0.5)
+                time.sleep(1.0 if self.is_bk else 0.5)  # BK takes longer to RST
 
-                # Configure for voltage sourcing
-                self._write_raw(self.commands['source_voltage'])
-                self._write_raw(':SOUR:VOLT:RANG:AUTO ON')
-                self._write_raw(':SYST:RSEN OFF')  # 2-wire mode
+                if self.is_bk:
+                    # *RST returns BK to local mode — re-enter remote and
+                    # re-select channel. No source-mode / 2-wire / sense-range.
+                    self.instrument.write('SYST:REM')
+                    time.sleep(0.2)
+                    self._write_raw(self.commands['select_channel'].format(self.channel))
+                    time.sleep(0.05)
+                else:
+                    # Configure Keithley for voltage sourcing
+                    self._write_raw(self.commands['source_voltage'])
+                    self._write_raw(':SOUR:VOLT:RANG:AUTO ON')
+                    self._write_raw(':SYST:RSEN OFF')  # 2-wire mode
 
-                # Set compliance
+                # Set compliance (current limit)
                 self._write_raw(self.commands['compliance_current'].format(self.compliance_current))
-                self._write_raw(f':SENS:CURR:RANG {self.compliance_current}')
-                print(f"Compliance: {self.compliance_current*1e6:.1f} uA")
+                if not self.is_bk:
+                    # Match Keithley sense range to compliance for fast reads
+                    self._write_raw(f':SENS:CURR:RANG {self.compliance_current}')
+                if self.compliance_current >= 1e-3:
+                    print(f"Compliance: {self.compliance_current:.3f} A")
+                else:
+                    print(f"Compliance: {self.compliance_current*1e6:.1f} uA")
 
                 # Set voltage to 0V
                 self._write_raw(self.commands['set_voltage'].format(0.0))
@@ -285,7 +352,7 @@ class KeithleyController:
 
                 self.connected = True
                 self._voltage_known = True
-                print(f"Keithley connected safely. Output ON at 0.000V")
+                print(f"{self.commands['name']} connected safely. Output ON at 0.000V")
                 return True
 
             except Exception as e:
@@ -518,8 +585,14 @@ class KeithleyController:
         self.compliance_current = current_limit
         if self.connected and self.instrument:
             self._write_raw(self.commands['compliance_current'].format(current_limit))
-            self._write_raw(f':SENS:CURR:RANG {current_limit}')
-            print(f"Keithley compliance set to {current_limit*1e9:.0f} nA")
+            if not self.is_bk:
+                # BK 9132B has no sense-range concept — its CURR command is
+                # the channel current limit, full stop.
+                self._write_raw(f':SENS:CURR:RANG {current_limit}')
+            if current_limit >= 1e-3:
+                print(f"{self.commands['name']} compliance set to {current_limit:.3f} A")
+            else:
+                print(f"{self.commands['name']} compliance set to {current_limit*1e9:.0f} nA")
 
     def check_compliance(self):
         """Check if compliance (current limit) has been reached.
