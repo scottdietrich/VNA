@@ -208,12 +208,18 @@ class VNAController:
         # Set sweep type to linear
         self.write(":SENS:SWE:TYPE LIN")
 
-        # Set S-parameter and ensure trace is active
-        self.write(f":CALC1:PAR1:DEF {self.s_parameter}")
-        self.write(":CALC1:PAR1:SEL")
+        # Preserve the user's trace analysis chain (gating, time-domain
+        # transform, etc.) by only redefining the S-parameter when it
+        # differs.  CALC1:PAR1:DEF resets the trace's processing pipeline,
+        # which would wipe any gating the user configured in S2VNA.
+        try:
+            current_par = (self.query(":CALC1:PAR1:DEF?") or "").strip().upper()
+        except Exception:
+            current_par = ""
+        if current_par != self.s_parameter.upper():
+            self.write(f":CALC1:PAR1:DEF {self.s_parameter}")
 
-        # Set data format to real/imag pairs
-        self.write(":CALC1:FORM SDAT")
+        self.write(":CALC1:PAR1:SEL")
 
         # Query actual settings for diagnostic
         try:
@@ -268,11 +274,16 @@ class VNAController:
         # Set source power
         self.write(f":SOUR:POW {power}")
 
-        # Set S-parameter
-        self.write(f":CALC1:PAR1:DEF {self.s_parameter}")
+        # Only redefine the S-parameter when it differs — DEF resets
+        # the trace's analysis chain (gating, etc.).
+        try:
+            current_par = (self.query(":CALC1:PAR1:DEF?") or "").strip().upper()
+        except Exception:
+            current_par = ""
+        if current_par != self.s_parameter.upper():
+            self.write(f":CALC1:PAR1:DEF {self.s_parameter}")
 
-        # Set data format to real/imag pairs
-        self.write(":CALC1:FORM SDAT")
+        self.write(":CALC1:PAR1:SEL")
 
         # Turn RF ON and keep it on continuously
         self.write(":OUTP ON")
@@ -413,8 +424,12 @@ class VNAController:
         # return immediately without waiting.  Sweep completion is verified
         # in trigger_sweep_timed() via stale-data detection instead.
 
+        # Select the trace so SDAT reads from the user's active trace
+        # (which carries any gating / analysis the user configured).
+        self.write(":CALC1:PAR1:SEL")
+
         # Get S-parameter data (real,imag pairs)
-        response = self.query(":CALC:DATA:SDAT?", large_data=True)
+        response = self.query(":CALC1:DATA:SDAT?", large_data=True)
 
         if not response:
             print("VNA get_sweep_data: No response")
