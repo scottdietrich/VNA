@@ -408,8 +408,28 @@ class VNAController:
         finally:
             self.socket.settimeout(old_timeout)
 
+    def _parse_fdat_response(self, response):
+        """Parse a CALC1:DATA:FDAT? response into a numpy array."""
+        if not response:
+            return None
+        values = np.fromstring(response, sep=',')
+        if len(values) == 0:
+            values = np.array([float(v.strip()) for v in response.split(',') if v.strip()])
+        return values if len(values) > 0 else None
+
     def get_sweep_data(self, expected_points=None):
         """Read sweep data as complex S-parameter array.
+
+        Uses FDAT (formatted trace data) which sits after gating in the
+        S5180B processing pipeline.  SDAT returns corrected data *before*
+        gating and electrical-delay, so it cannot capture time-domain
+        gating the user sets up in S2VNA.
+
+        To get complex R+jI from FDAT, we temporarily switch the display
+        format to REAL then IMAG and read each component.  The original
+        display format is restored immediately after.  In single-sweep
+        mode the data buffer is static between reads, so the two halves
+        are consistent.
 
         Args:
             expected_points: Expected number of points (for logging only)
@@ -420,40 +440,39 @@ class VNAController:
         if not self.connected:
             return None
 
-        # Note: *OPC? and *WAI do NOT work on the S5180B over TCP — they
-        # return immediately without waiting.  Sweep completion is verified
-        # in trigger_sweep_timed() via stale-data detection instead.
-
-        # Select the trace so SDAT reads from the user's active trace
-        # (which carries any gating / analysis the user configured).
+        # Select the trace that carries the user's gating / analysis.
         self.write(":CALC1:PAR1:SEL")
 
-        # Get S-parameter data (real,imag pairs)
-        response = self.query(":CALC1:DATA:SDAT?", large_data=True)
+        # Save current display format so we can restore it.
+        orig_format = self.query(":CALC1:FORM?")
 
-        if not response:
-            print("VNA get_sweep_data: No response")
+        # Read real part via FDAT (post-gating).
+        self.write(":CALC1:FORM REAL")
+        real_response = self.query(":CALC1:DATA:FDAT?", large_data=True)
+
+        # Read imaginary part via FDAT (post-gating).
+        self.write(":CALC1:FORM IMAG")
+        imag_response = self.query(":CALC1:DATA:FDAT?", large_data=True)
+
+        # Restore the user's display format immediately.
+        if orig_format:
+            self.write(f":CALC1:FORM {orig_format.strip()}")
+
+        if not real_response or not imag_response:
+            print("VNA get_sweep_data: No response from FDAT")
             return None
 
         try:
-            # Fast parsing using numpy
-            values = np.fromstring(response, sep=',')
+            real_vals = self._parse_fdat_response(real_response)
+            imag_vals = self._parse_fdat_response(imag_response)
 
-            if len(values) < 2:
-                # Try alternate parsing
-                values = [float(v.strip()) for v in response.split(',') if v.strip()]
-                values = np.array(values)
-
-            if len(values) < 2:
-                print(f"VNA: Only got {len(values)} values")
+            if real_vals is None or imag_vals is None:
+                print("VNA get_sweep_data: Could not parse FDAT response")
                 return None
 
-            # Reshape to (N, 2) and convert to complex
-            n_points = len(values) // 2
-            values = values[:n_points * 2].reshape(-1, 2)
-            complex_data = values[:, 0] + 1j * values[:, 1]
+            n_points = min(len(real_vals), len(imag_vals))
+            complex_data = real_vals[:n_points] + 1j * imag_vals[:n_points]
 
-            # Log if point count doesn't match expected
             if expected_points and n_points != expected_points:
                 print(f"WARNING: VNA returned {n_points} points, expected {expected_points}")
 
@@ -525,7 +544,7 @@ class VNAController:
 
         print("VNA: flushing socket and resetting state...")
 
-        # Step 1: Drain TCP receive buffer (may have partial SDAT response)
+        # Step 1: Drain TCP receive buffer (may have partial FDAT response)
         try:
             self.socket.setblocking(False)
             drained = 0
