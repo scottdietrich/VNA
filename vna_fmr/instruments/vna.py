@@ -409,13 +409,19 @@ class VNAController:
             self.socket.settimeout(old_timeout)
 
     def _parse_fdat_response(self, response):
-        """Parse a CALC1:DATA:FDAT? response into a numpy array."""
+        """Parse a CALC1:DATA:FDAT? response into a numpy array.
+
+        CMT FDAT returns 2 values per point for all formats.  For scalar
+        formats (REAL, IMAG, MLOG, …) the second of each pair is 0.
+        """
         if not response:
             return None
         values = np.fromstring(response, sep=',')
         if len(values) == 0:
             values = np.array([float(v.strip()) for v in response.split(',') if v.strip()])
-        return values if len(values) > 0 else None
+        if len(values) == 0:
+            return None
+        return values[::2]
 
     def get_sweep_data(self, expected_points=None):
         """Read sweep data as complex S-parameter array.
